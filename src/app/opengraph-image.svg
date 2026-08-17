@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="iconBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+    <linearGradient id="star" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#cbd5e1" />
+    </linearGradient>
+  </defs>
+  
+  <rect width="1200" height="630" fill="url(#bg)" />
+  
+  <!-- Abstract background pattern -->
+  <circle cx="900" cy="150" r="400" fill="#38bdf8" opacity="0.03" />
+  <circle cx="200" cy="500" r="300" fill="#818cf8" opacity="0.03" />
+  
+  <g transform="translate(100, 160)">
+    <!-- Icon -->
+    <rect width="140" height="140" rx="32" fill="url(#iconBg)" stroke="#334155" stroke-width="2" />
+    
+    <path d="M70 30 L76 56 L102 62 L76 68 L70 94 L64 68 L38 62 L64 56 Z" fill="url(#star)" />
+    <path d="M105 85 L108 97 L120 100 L108 103 L105 115 L102 103 L90 100 L102 97 Z" fill="url(#star)" opacity="0.8" />
+    <path d="M35 35 L37 43 L45 45 L37 47 L35 55 L33 47 L25 45 L33 43 Z" fill="url(#star)" opacity="0.6" />
+    
+    <!-- Title -->
+    <text x="180" y="75" font-family="system-ui, -apple-system, sans-serif" font-size="64" font-weight="bold" fill="#f8fafc">AI API Playground</text>
+    
+    <!-- Subtitle -->
+    <text x="180" y="125" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="500" fill="#94a3b8">Local-First MCP Developer Console</text>
+  </g>
+  
+  <!-- Features list -->
+  <g transform="translate(100, 420)" font-family="system-ui, -apple-system, sans-serif" font-size="24" font-weight="500" fill="#cbd5e1">
+    <circle cx="0" cy="-7" r="4" fill="#38bdf8" />
+    <text x="20" y="0">Zero-Backend-Cost (BYOK)</text>
+    
+    <circle cx="0" cy="43" r="4" fill="#38bdf8" />
+    <text x="20" y="50">GitHub MCP Integration</text>
+    
+    <circle cx="450" cy="-7" r="4" fill="#818cf8" />
+    <text x="470" y="0">Local-First & Private</text>
+    
+    <circle cx="450" cy="43" r="4" fill="#818cf8" />
+    <text x="470" y="50">Full Traceability & JSON Logs</text>
+  </g>
+</svg>
