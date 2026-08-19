@@ -50,7 +50,34 @@ Open [http://localhost:3000](http://localhost:3000) to view the workspace.
 4. Once connected, all available GitHub tools (like `get_me`, `get_file_contents`, etc.) will load instantly!
 5. Optional: Toggle **GitHub Write Mode** in the server settings to filter out non-read tools, keeping your prompt context small and avoiding rate limits on smaller models.
 
-### 4. Interactive Chat & Safety
+### 4. Bring Your Own MCP (Custom Remote Servers)
+Connect **any** remote MCP server — not just the built-in GitHub preset — by
+adding it directly in the right sidebar.
+
+1. Switch to the **MCP Servers** tab on the right sidebar.
+2. In the **Add Remote MCP Server** form (it stays pinned above your custom
+   servers, so it's always reachable):
+   - Give the server a **Name** (e.g. `Tavily Search`).
+   - Paste the server's **URL** — a Streamable HTTP or SSE endpoint
+     (e.g. `https://mcp.tavily.com/mcp`).
+   - Add whatever **headers** that server's docs require, commonly
+     `Authorization: Bearer <your-key>`. Use **"+ Add header"** to add more than
+     one (e.g. an API key header plus a version header).
+3. Click **Add Remote Server**, then **Connect**. Once connected, the server's
+   tools load and become available to the agent.
+4. Edit or delete any custom server later using the pencil / trash icons on its
+   card — changes are saved locally in your browser.
+
+> **Example:** Tavily's remote MCP (`https://mcp.tavily.com/mcp`) works with a
+> single `Authorization: Bearer <your Tavily key>` header. This is just one
+> example among many — the app is intentionally vendor-neutral, so you can plug
+> in any Streamable HTTP / SSE MCP server.
+
+> **Security note:** MCP tool output is **untrusted content**. The model should
+> treat tool results as data, never as instructions. Review tool arguments
+> before approving, and only connect servers you trust.
+
+### 5. Interactive Chat & Safety
 1. Start a new chat session.
 2. When the LLM decides to use a tool, it will enter a **"Needs Approval"** state.
 3. Review the tool arguments and click **Confirm & Run** to execute the tool or **Deny** to cancel.

@@ -1,8 +1,8 @@
 "use client";
 
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from "react";
-import { Session, AppSettings, McpServer, ChatRequestBody, Message } from "@/lib/types";
-import { getSessions, getSettings, saveSettings, getMcpServers } from "@/lib/db";
+import { Session, AppSettings, McpServer, McpServerConfig, ChatRequestBody, Message } from "@/lib/types";
+import { getSessions, getSettings, saveSettings, getMcpServers, saveMcpServer, deleteMcpServer } from "@/lib/db";
 import { initializeMcp, listMcpTools, McpTool } from "@/lib/mcp/client";
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -53,6 +53,8 @@ const WELCOME_MESSAGES: Message[] = [
   }
 ];
 
+export type WorkspaceTheme = "light" | "dark" | "system";
+
 export type WorkspaceContextType = {
   // DB state
   sessions: Session[];
@@ -65,9 +67,16 @@ export type WorkspaceContextType = {
   settings: AppSettings;
   updateSettings: (newSettings: Partial<AppSettings>) => void;
 
+  // Theme
+  theme: WorkspaceTheme;
+  setTheme: (theme: WorkspaceTheme) => void;
+
   // MCP
   mcpServers: McpServer[];
   toggleMcpServer: (id: string, tools?: McpTool[]) => void;
+  addMcpServer: (config: McpServerConfig) => void;
+  updateMcpServer: (id: string, patch: Partial<McpServerConfig>) => void;
+  removeMcpServer: (id: string) => void;
 
   // UI State
   isLeftSidebarOpen: boolean;
@@ -112,12 +121,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, [settings]);
 
   const [mcpServers, setMcpServers] = useState<McpServer[]>(DEFAULT_MCP_SERVERS);
+  const mcpServersRef = useRef(mcpServers);
+  useEffect(() => {
+    mcpServersRef.current = mcpServers;
+  }, [mcpServers]);
 
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
   const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(true);
   const [activeRightTab, setActiveRightTab] = useState<"inspector" | "mcp">("inspector");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  const [theme, setThemeState] = useState<WorkspaceTheme>("system");
   const [selectedModel, setSelectedModel] = useState("openai");
   const [messages, setMessages] = useState(WELCOME_MESSAGES);
   const [input, setInput] = useState("");
@@ -138,6 +152,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         loadedSettings = migrated;
         if (migrated.defaultModel) {
           setSelectedModel(migrated.defaultModel);
+        }
+        if (migrated.theme) {
+          setThemeState(migrated.theme);
         }
       } else {
         // Default rememberKeys to true
@@ -160,9 +177,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       const githubServer = loadedServers.find(s => s.id === "github");
       if (githubServer && loadedSettings.githubPat) {
         try {
-          const token = loadedSettings.githubPat;
-          await initializeMcp(githubServer.url, token);
-          const tools = await listMcpTools(githubServer.url, token);
+          const authHeaders: Record<string, string> = loadedSettings.githubPat
+            ? { Authorization: `Bearer ${loadedSettings.githubPat}` }
+            : {};
+          await initializeMcp(githubServer.url, authHeaders);
+          const tools = await listMcpTools(githubServer.url, authHeaders);
 
           setMcpServers(prev => prev.map(s => {
             if (s.id === "github") {
@@ -176,6 +195,41 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       }
     }
     load();
+  }, []);
+
+  // Apply theme to <html> element
+  useEffect(() => {
+    const root = document.documentElement;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+
+    const apply = (t: WorkspaceTheme) => {
+      root.classList.remove("dark", "light");
+      if (t === "dark") {
+        root.classList.add("dark");
+      } else if (t === "light") {
+        root.classList.add("light");
+      } else {
+        // system: follow OS preference
+        root.classList.add(mql.matches ? "dark" : "light");
+      }
+    };
+
+    apply(theme);
+
+    if (theme === "system") {
+      const handler = () => apply("system");
+      mql.addEventListener("change", handler);
+      return () => mql.removeEventListener("change", handler);
+    }
+  }, [theme]);
+
+  const setTheme = useCallback((newTheme: WorkspaceTheme) => {
+    setThemeState(newTheme);
+    // Persist theme choice (always save, regardless of rememberKeys)
+    const updated = { ...settingsRef.current, theme: newTheme };
+    settingsRef.current = updated;
+    setSettings(updated);
+    saveSettings(updated);
   }, []);
 
   const updateSettings = useCallback(async (newS: Partial<AppSettings>) => {
@@ -219,11 +273,41 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }));
   };
 
+  // Persist only the config fields (strip runtime-only status/tools).
+  const toConfig = (server: McpServer): McpServerConfig => {
+    const config: Record<string, unknown> = { ...server };
+    delete config.status;
+    delete config.tools;
+    return config as McpServerConfig;
+  };
+
+  // Add a custom ("bring your own") MCP server and persist it locally.
+  const addMcpServer = (config: McpServerConfig) => {
+    const newServer: McpServer = { ...config, status: "disconnected", tools: [] };
+    setMcpServers(prev => [...prev, newServer]);
+    saveMcpServer(toConfig(newServer));
+  };
+
+  // Update a custom MCP server's config and persist it locally.
+  const updateMcpServer = (id: string, patch: Partial<McpServerConfig>) => {
+    setMcpServers(prev => prev.map(s => (s.id === id ? { ...s, ...patch } : s)));
+    const existing = mcpServersRef.current.find(s => s.id === id);
+    if (existing) {
+      saveMcpServer(toConfig({ ...existing, ...patch }));
+    }
+  };
+
+  // Remove a custom MCP server (local list + IndexedDB).
+  const removeMcpServer = (id: string) => {
+    setMcpServers(prev => prev.filter(s => s.id !== id));
+    deleteMcpServer(id);
+  };
+
   return (
     <WorkspaceContext.Provider value={{
       sessions, activeSessionId, setActiveSessionId, startNewSession, refreshSessions,
       settings, updateSettings,
-      mcpServers, toggleMcpServer,
+      mcpServers, toggleMcpServer, addMcpServer, updateMcpServer, removeMcpServer,
       isLeftSidebarOpen, setIsLeftSidebarOpen,
       isRightSidebarOpen, setIsRightSidebarOpen,
       activeRightTab, setActiveRightTab,
@@ -233,6 +317,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       input, setInput,
       rawRequestJson, setRawRequestJson,
       rawResponseJson, setRawResponseJson,
+      theme, setTheme,
       tokensCount, setTokensCount, latency, setLatency
     }}>
       {children}

@@ -11,6 +11,9 @@ import {
   ExternalLink,
   ChevronDown,
   CheckCircle2,
+  Pencil,
+  X,
+  Save,
 } from "lucide-react";
 import { useWorkspace } from "@/context/WorkspaceContext";
 import { initializeMcp, listMcpTools, callMcpTool, McpTool } from "@/lib/mcp/client";
@@ -26,6 +29,9 @@ export default function RightPanel() {
     setActiveRightTab,
     mcpServers,
     toggleMcpServer,
+    addMcpServer,
+    updateMcpServer,
+    removeMcpServer,
     settings,
     updateSettings,
     selectedModel,
@@ -39,9 +45,8 @@ export default function RightPanel() {
   // Custom MCP Adding State
   const [newMcpName, setNewMcpName] = useState("");
   const [newMcpUrl, setNewMcpUrl] = useState("");
-  const [newMcpHeaderName, setNewMcpHeaderName] = useState("");
-  const [newMcpHeaderValue, setNewMcpHeaderValue] = useState("");
-  const [customMcpList, setCustomMcpList] = useState<McpServer[]>([]);
+  const [newMcpHeaders, setNewMcpHeaders] = useState<{ name: string; value: string }[]>([{ name: "", value: "" }]);
+  const [editingServerId, setEditingServerId] = useState<string | null>(null);
 
   // Selected tool runner state
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
@@ -60,6 +65,43 @@ export default function RightPanel() {
 
   if (!isRightSidebarOpen) return null;
 
+  const presetServers = mcpServers.filter((s) => s.preset);
+  const customServers = mcpServers.filter((s) => !s.preset);
+
+  // Build the exact headers to send for a server. GitHub is just a preset whose
+  // PAT becomes an Authorization: Bearer header; any custom server's stored
+  // headers are forwarded as-is (including multiple entries).
+  const getAuthHeaders = (server: McpServer): Record<string, string> =>
+    server.preset === "github" && settings.githubPat
+      ? { Authorization: `Bearer ${settings.githubPat}` }
+      : server.headers || {};
+
+  const buildHeadersObject = (): Record<string, string> => {
+    const headers: Record<string, string> = {};
+    for (const row of newMcpHeaders) {
+      const name = row.name.trim();
+      if (name) {
+        headers[name] = row.value;
+      }
+    }
+    return headers;
+  };
+
+  const resetForm = () => {
+    setNewMcpName("");
+    setNewMcpUrl("");
+    setNewMcpHeaders([{ name: "", value: "" }]);
+    setEditingServerId(null);
+  };
+
+  const addHeaderRow = () => setNewMcpHeaders((prev) => [...prev, { name: "", value: "" }]);
+
+  const updateHeaderRow = (idx: number, patch: Partial<{ name: string; value: string }>) =>
+    setNewMcpHeaders((prev) => prev.map((row, i) => (i === idx ? { ...row, ...patch } : row)));
+
+  const removeHeaderRow = (idx: number) =>
+    setNewMcpHeaders((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
+
   const handleConnectMcp = async (server: McpServer) => {
     // If already connected, disconnect and return
     if (server.status === "connected") {
@@ -70,9 +112,9 @@ export default function RightPanel() {
 
     setConnectingServerId(server.id);
     try {
-      const token = server.preset === "github" ? settings.githubPat : undefined;
-      await initializeMcp(server.url, token);
-      const tools = await listMcpTools(server.url, token);
+      const authHeaders = getAuthHeaders(server);
+      await initializeMcp(server.url, authHeaders);
+      const tools = await listMcpTools(server.url, authHeaders);
 
       setDiscoveredTools(tools);
       setSelectedServerId(server.id);
@@ -94,19 +136,54 @@ export default function RightPanel() {
       alert("Name and URL are required.");
       return;
     }
-    const newServer: McpServer = {
+    const headers = buildHeadersObject();
+    addMcpServer({
       id: `custom-${Date.now()}`,
       name: newMcpName,
       description: "User defined MCP Server",
       url: newMcpUrl,
-      status: "disconnected",
-      headers: newMcpHeaderName ? { [newMcpHeaderName]: newMcpHeaderValue } : undefined,
-    };
-    setCustomMcpList((prev) => [...prev, newServer]);
-    setNewMcpName("");
-    setNewMcpUrl("");
-    setNewMcpHeaderName("");
-    setNewMcpHeaderValue("");
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+    });
+    resetForm();
+  };
+
+  const startEdit = (server: McpServer) => {
+    setEditingServerId(server.id);
+    setNewMcpName(server.name);
+    setNewMcpUrl(server.url);
+    const entries = Object.entries(server.headers || {});
+    setNewMcpHeaders(entries.length > 0 ? entries.map(([name, value]) => ({ name, value })) : [{ name: "", value: "" }]);
+    requestAnimationFrame(() => {
+      document.getElementById("add-custom-mcp-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  const handleSaveEdit = () => {
+    if (!editingServerId) return;
+    if (!newMcpName || !newMcpUrl) {
+      alert("Name and URL are required.");
+      return;
+    }
+    const headers = buildHeadersObject();
+    updateMcpServer(editingServerId, {
+      name: newMcpName,
+      url: newMcpUrl,
+      description: "User defined MCP Server",
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+    });
+    resetForm();
+    alert("Server updated.");
+  };
+
+  const handleDeleteCustomMcp = (server: McpServer) => {
+    if (!window.confirm(`Delete custom MCP server "${server.name}"?`)) return;
+    removeMcpServer(server.id);
+    if (selectedServerId === server.id) {
+      setSelectedServerId(null);
+      setDiscoveredTools([]);
+      setSelectedTool(null);
+      setToolExecutionResult(null);
+    }
   };
 
   const handleExecuteTool = async () => {
@@ -114,13 +191,13 @@ export default function RightPanel() {
     setIsExecutingTool(true);
     setToolExecutionResult(null);
 
-    const activeServ = [...mcpServers, ...customMcpList].find(s => s.id === selectedServerId);
+    const activeServ = mcpServers.find((s) => s.id === selectedServerId);
     if (!activeServ) return;
 
     try {
       const parsedArgs = JSON.parse(toolArguments) as Record<string, unknown>;
-      const token = activeServ.preset === "github" ? settings.githubPat : undefined;
-      const res = await callMcpTool(activeServ.url, token, selectedTool.name, parsedArgs);
+      const authHeaders = getAuthHeaders(activeServ);
+      const res = await callMcpTool(activeServ.url, authHeaders, selectedTool.name, parsedArgs);
       setToolExecutionResult(res);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -286,180 +363,263 @@ export default function RightPanel() {
           </div>
         ) : (
           <div className="p-4 space-y-5">
-            {/* Built-in MCP Servers */}
-            <div className="space-y-3">
+            {/* Built-in / Preset MCP Servers */}
+            {presetServers.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between px-1">
+                  <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                    Presets
+                  </h3>
+                </div>
+
+                {presetServers.map((server) => (
+                  <div key={server.id} className="p-3 bg-background rounded-xl border border-border shadow-sm space-y-2.5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-0.5">
+                        <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                          {server.name}
+                          {server.status === "connected" && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500/10" />}
+                        </div>
+                        <div className="text-[11px] text-muted-foreground leading-snug">{server.description}</div>
+                      </div>
+                    </div>
+
+                    {server.preset === "github" && (
+                      <div className="space-y-1.5 pt-1">
+                        <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                          Personal Access Token (PAT)
+                        </label>
+                        <input
+                          type="password"
+                          placeholder="ghp_..."
+                          value={settings.githubPat || ""}
+                          onChange={(e) => updateSettings({ githubPat: e.target.value })}
+                          className="w-full bg-muted/20 border border-input rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                        />
+                        <div className="flex justify-between items-center text-[10px]">
+                          <span className="text-muted-foreground">Scopes: Contents read, Issues, PRs</span>
+                          <a
+                            href="https://github.com/settings/personal-access-tokens/new"
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-primary hover:underline flex items-center gap-0.5 font-medium"
+                          >
+                            Create Fine-Grained PAT
+                            <ExternalLink className="w-2.5 h-2.5" />
+                          </a>
+                        </div>
+
+                        {/* Collapsible GitHub Write Mode Section */}
+                        <div className="pt-2.5 border-t border-border/40 mt-2">
+                          <div className="text-[10px] text-amber-600 dark:text-amber-500 font-semibold italic mb-2 leading-snug">
+                            ⚠️ GitHub MCP requires ~30,000 TPM to function properly.
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setIsGithubWriteModeExpanded(!isGithubWriteModeExpanded)}
+                            className="w-full flex items-center justify-between text-[10px] font-bold text-muted-foreground uppercase tracking-wider hover:text-foreground transition-colors cursor-pointer"
+                          >
+                            <span>GitHub Write Mode Settings</span>
+                            <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isGithubWriteModeExpanded ? "rotate-180" : ""}`} />
+                          </button>
+
+                          {isGithubWriteModeExpanded && (
+                            <div className="mt-2 space-y-2 animate-in slide-in-from-top-1 duration-150">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[10px] font-semibold text-muted-foreground uppercase">Enable Write Actions</span>
+                                <button
+                                  onClick={() => updateSettings({ githubWriteMode: settings.githubWriteMode !== false ? false : true })}
+                                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${settings.githubWriteMode !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`}
+                                >
+                                  <span
+                                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-background shadow ring-0 transition duration-200 ease-in-out ${settings.githubWriteMode !== false ? 'translate-x-4' : 'translate-x-0'}`}
+                                  />
+                                </button>
+                              </div>
+                              {settings.githubWriteMode === false ? (
+                                <div className="text-[9px] text-amber-600 dark:text-amber-500 font-semibold leading-snug bg-amber-500/10 p-1.5 rounded-lg border border-amber-500/10">
+                                  ⚠️ Write tools filtered (saves tokens, could fit free tier limit).
+                                </div>
+                              ) : (
+                                <div className="text-[9px] text-rose-600 dark:text-rose-500 font-semibold leading-snug bg-rose-500/10 p-1.5 rounded-lg border border-rose-500/10">
+                                  🚨 Full tools enabled (might hit free tier token limits).
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-between pt-1.5 border-t border-muted/50">
+                      <span className="text-[10px] font-mono text-muted-foreground uppercase">{server.status}</span>
+                      <button
+                        onClick={() => handleConnectMcp(server)}
+                        disabled={connectingServerId === server.id}
+                        className={`text-[11px] font-semibold px-2.5 py-1 rounded-md transition-colors cursor-pointer ${server.status === "connected"
+                          ? "text-destructive hover:bg-destructive/5"
+                          : "text-primary hover:bg-primary/5"
+                          }`}
+                      >
+                        {connectingServerId === server.id ? "Connecting..." : server.status === "connected" ? "Disconnect" : "Connect"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Add Remote MCP Server — pinned so it's always reachable; added
+                servers stack in the Custom Servers list right below it */}
+            <div id="add-custom-mcp-form" className="sticky top-0 z-10 -mx-4 px-4 pt-3 pb-3 space-y-2.5 bg-sidebar border-b border-border/50 shadow-sm scroll-mt-2">
               <div className="flex items-center justify-between px-1">
                 <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
-                  Presets
+                  {editingServerId ? "Edit Remote MCP Server" : "Add Remote MCP Server"}
                 </h3>
+                {editingServerId && (
+                  <button
+                    onClick={resetForm}
+                    className="text-[10px] font-semibold text-muted-foreground hover:text-foreground uppercase tracking-wider cursor-pointer"
+                  >
+                    Cancel edit
+                  </button>
+                )}
               </div>
-
-              {mcpServers.map((server) => (
-                <div key={server.id} className="p-3 bg-background rounded-xl border border-border shadow-sm space-y-2.5">
-                  <div className="flex items-start justify-between">
-                    <div className="space-y-0.5">
-                      <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
-                        {server.name}
-                        {server.status === "connected" && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500/10" />}
-                      </div>
-                      <div className="text-[11px] text-muted-foreground leading-snug">{server.description}</div>
-                    </div>
-                  </div>
-
-                  {server.preset === "github" && (
-                    <div className="space-y-1.5 pt-1">
-                      <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                        Personal Access Token (PAT)
-                      </label>
-                      <input
-                        type="password"
-                        placeholder="ghp_..."
-                        value={settings.githubPat || ""}
-                        onChange={(e) => updateSettings({ githubPat: e.target.value })}
-                        className="w-full bg-muted/20 border border-input rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
-                      />
-                      <div className="flex justify-between items-center text-[10px]">
-                        <span className="text-muted-foreground">Scopes: Contents read, Issues, PRs</span>
-                        <a
-                          href="https://github.com/settings/personal-access-tokens/new"
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-primary hover:underline flex items-center gap-0.5 font-medium"
-                        >
-                          Create Fine-Grained PAT
-                          <ExternalLink className="w-2.5 h-2.5" />
-                        </a>
-                      </div>
-
-                      {/* Collapsible GitHub Write Mode Section */}
-                      <div className="pt-2.5 border-t border-border/40 mt-2">
-                        <div className="text-[10px] text-amber-600 dark:text-amber-500 font-semibold italic mb-2 leading-snug">
-                          ⚠️ GitHub MCP requires ~30,000 TPM to function properly.
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setIsGithubWriteModeExpanded(!isGithubWriteModeExpanded)}
-                          className="w-full flex items-center justify-between text-[10px] font-bold text-muted-foreground uppercase tracking-wider hover:text-foreground transition-colors cursor-pointer"
-                        >
-                          <span>GitHub Write Mode Settings</span>
-                          <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isGithubWriteModeExpanded ? "rotate-180" : ""}`} />
-                        </button>
-
-                        {isGithubWriteModeExpanded && (
-                          <div className="mt-2 space-y-2 animate-in slide-in-from-top-1 duration-150">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-semibold text-muted-foreground uppercase">Enable Write Actions</span>
-                              <button
-                                onClick={() => updateSettings({ githubWriteMode: settings.githubWriteMode !== false ? false : true })}
-                                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${settings.githubWriteMode !== false ? 'bg-primary' : 'bg-muted-foreground/30'}`}
-                              >
-                                <span
-                                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-background shadow ring-0 transition duration-200 ease-in-out ${settings.githubWriteMode !== false ? 'translate-x-4' : 'translate-x-0'}`}
-                                />
-                              </button>
-                            </div>
-                            {settings.githubWriteMode === false ? (
-                              <div className="text-[9px] text-amber-600 dark:text-amber-500 font-semibold leading-snug bg-amber-500/10 p-1.5 rounded-lg border border-amber-500/10">
-                                ⚠️ Write tools filtered (saves tokens, could fit free tier limit).
-                              </div>
-                            ) : (
-                              <div className="text-[9px] text-rose-600 dark:text-rose-500 font-semibold leading-snug bg-rose-500/10 p-1.5 rounded-lg border border-rose-500/10">
-                                🚨 Full tools enabled (might hit free tier token limits).
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-between pt-1.5 border-t border-muted/50">
-                    <span className="text-[10px] font-mono text-muted-foreground uppercase">{server.status}</span>
-                    <button
-                      onClick={() => handleConnectMcp(server)}
-                      disabled={connectingServerId === server.id}
-                      className={`text-[11px] font-semibold px-2.5 py-1 rounded-md transition-colors cursor-pointer ${server.status === "connected"
-                        ? "text-destructive hover:bg-destructive/5"
-                        : "text-primary hover:bg-primary/5"
-                        }`}
-                    >
-                      {connectingServerId === server.id ? "Connecting..." : server.status === "connected" ? "Disconnect" : "Connect"}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {/* Custom MCP Server Addition */}
-            <div className="space-y-2.5 pt-2">
-              <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider px-1">
-                Add Custom Remote MCP
-              </h3>
               <div className="p-3 bg-background rounded-xl border border-border shadow-sm space-y-2">
                 <input
                   type="text"
-                  placeholder="Server Name"
+                  placeholder="Server Name (e.g. Tavily Search)"
                   value={newMcpName}
                   onChange={(e) => setNewMcpName(e.target.value)}
                   className="w-full bg-muted/20 border border-input rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
                 />
                 <input
                   type="text"
-                  placeholder="URL (https://...)"
+                  placeholder="URL (https://... e.g. https://mcp.tavily.com/mcp)"
                   value={newMcpUrl}
                   onChange={(e) => setNewMcpUrl(e.target.value)}
                   className="w-full bg-muted/20 border border-input rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
                 />
-                <div className="grid grid-cols-2 gap-1.5">
-                  <input
-                    type="text"
-                    placeholder="Header Name"
-                    value={newMcpHeaderName}
-                    onChange={(e) => setNewMcpHeaderName(e.target.value)}
-                    className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-[10px] focus:outline-none focus:ring-1 focus:ring-primary"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Header Value"
-                    value={newMcpHeaderValue}
-                    onChange={(e) => setNewMcpHeaderValue(e.target.value)}
-                    className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-[10px] focus:outline-none focus:ring-1 focus:ring-primary"
-                  />
+
+                {/* Repeatable headers */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                      Headers
+                    </label>
+                    <button
+                      type="button"
+                      onClick={addHeaderRow}
+                      className="text-[10px] font-semibold text-primary hover:underline flex items-center gap-0.5 cursor-pointer"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add header
+                    </button>
+                  </div>
+                  {newMcpHeaders.map((row, idx) => (
+                    <div key={idx} className="grid grid-cols-[1fr_1fr_auto] gap-1.5 items-center">
+                      <input
+                        type="text"
+                        placeholder="Name (e.g. Authorization)"
+                        value={row.name}
+                        onChange={(e) => updateHeaderRow(idx, { name: e.target.value })}
+                        className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-[10px] font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Value (e.g. Bearer key)"
+                        value={row.value}
+                        onChange={(e) => updateHeaderRow(idx, { value: e.target.value })}
+                        className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-[10px] font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeHeaderRow(idx)}
+                        disabled={newMcpHeaders.length <= 1}
+                        title="Remove header"
+                        className="p-1 text-muted-foreground hover:text-destructive transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                <button
-                  onClick={handleAddCustomMcp}
-                  className="w-full bg-primary text-primary-foreground font-semibold py-1 px-3 rounded-lg text-xs flex items-center justify-center gap-1 hover:bg-primary/90 cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  Add Remote Server
-                </button>
+
+                {editingServerId ? (
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={handleSaveEdit}
+                      className="flex-1 bg-primary text-primary-foreground font-semibold py-1 px-3 rounded-lg text-xs flex items-center justify-center gap-1 hover:bg-primary/90 cursor-pointer"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      Save Changes
+                    </button>
+                    <button
+                      onClick={resetForm}
+                      className="px-3 border border-border bg-background text-foreground font-semibold py-1 rounded-lg text-xs hover:bg-muted transition-colors cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={handleAddCustomMcp}
+                    className="w-full bg-primary text-primary-foreground font-semibold py-1 px-3 rounded-lg text-xs flex items-center justify-center gap-1 hover:bg-primary/90 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Add Remote Server
+                  </button>
+                )}
               </div>
             </div>
 
             {/* User Custom MCPs */}
-            {customMcpList.length > 0 && (
+            {customServers.length > 0 && (
               <div className="space-y-2">
                 <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider px-1">
                   Custom Servers
                 </h3>
-                {customMcpList.map((server) => (
-                  <div key={server.id} className="p-3 bg-background rounded-xl border border-border shadow-sm space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold text-foreground">{server.name}</span>
-                      <button
-                        onClick={() => setCustomMcpList((prev) => prev.filter((s) => s.id !== server.id))}
-                        className="text-muted-foreground hover:text-destructive transition-colors p-1"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                {customServers.map((server) => (
+                  <div key={server.id} className="p-3 bg-background rounded-xl border border-border shadow-sm space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="space-y-0.5 min-w-0">
+                        <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                          <span className="truncate">{server.name}</span>
+                          {server.status === "connected" && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500/10 shrink-0" />}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground truncate">{server.url}</div>
+                        {server.headers && Object.keys(server.headers).length > 0 && (
+                          <div className="text-[10px] text-muted-foreground/70">
+                            {Object.keys(server.headers).length} header{Object.keys(server.headers).length > 1 ? "s" : ""}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-0.5 shrink-0">
+                        <button
+                          onClick={() => startEdit(server)}
+                          title="Edit server"
+                          className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors cursor-pointer"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteCustomMcp(server)}
+                          title="Delete server"
+                          className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/5 rounded-md transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="text-[10px] text-muted-foreground truncate">{server.url}</div>
                     <button
                       onClick={() => handleConnectMcp(server)}
                       disabled={connectingServerId === server.id}
-                      className="w-full border border-border hover:bg-muted text-foreground text-xs py-1 px-2 rounded-lg font-medium transition-colors"
+                      className={`w-full text-xs py-1 px-2 rounded-lg font-medium transition-colors cursor-pointer border ${server.status === "connected"
+                        ? "text-destructive border-destructive/20 hover:bg-destructive/5"
+                        : "text-foreground border-border hover:bg-muted"
+                        }`}
                     >
-                      {connectingServerId === server.id ? "Connecting..." : server.status === "connected" ? "Connected" : "Connect"}
+                      {connectingServerId === server.id ? "Connecting..." : server.status === "connected" ? "Disconnect" : "Connect"}
                     </button>
                   </div>
                 ))}

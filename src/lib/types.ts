@@ -114,6 +114,7 @@ export type AppSettings = {
   rememberKeys: boolean;
   defaultModel?: string;
   githubWriteMode?: boolean;
+  theme?: "light" | "dark" | "system";
 };
 
 export type GitHubContext = {

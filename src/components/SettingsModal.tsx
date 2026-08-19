@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useState } from "react";
-import { Sliders, X, Check, ChevronDown, Trash2, Plus } from "lucide-react";
-import { useWorkspace } from "@/context/WorkspaceContext";
+import { Sliders, X, Check, ChevronDown, Trash2, Plus, Monitor, Sun, Moon } from "lucide-react";
+import { useWorkspace, WorkspaceTheme } from "@/context/WorkspaceContext";
 import { AppSettings, SavedProvider } from "@/lib/types";
 
 export default function SettingsModal() {
@@ -14,7 +14,7 @@ export default function SettingsModal() {
 }
 
 function SettingsForm() {
-  const { setIsSettingsOpen, settings, updateSettings, setSelectedModel } = useWorkspace();
+  const { setIsSettingsOpen, settings, updateSettings, setSelectedModel, theme, setTheme } = useWorkspace();
 
   const [systemPrompt, setSystemPrompt] = useState(settings.systemPrompt || "");
   const [customBaseUrl, setCustomBaseUrl] = useState(settings.customBaseUrl || "");
@@ -428,6 +428,35 @@ function SettingsForm() {
           </div>
           <div className="text-[10px] text-amber-600 dark:text-amber-500 font-medium italic leading-snug">
             ⚠️ Warning: Enabling this persists your keys in your local browser database. They are never sent to our servers.
+          </div>
+
+          <div className="h-[1px] w-full bg-border my-3" />
+
+          {/* Theme Toggle */}
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              Theme
+            </label>
+            <div className="flex gap-1 bg-muted/20 rounded-xl p-1">
+              {([
+                { value: "system" as WorkspaceTheme, label: "System", icon: Monitor },
+                { value: "light" as WorkspaceTheme, label: "Light", icon: Sun },
+                { value: "dark" as WorkspaceTheme, label: "Dark", icon: Moon },
+              ]).map(({ value, label, icon: Icon }) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setTheme(value)}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${theme === value
+                      ? "bg-primary text-primary-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                    }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

@@ -21,10 +21,15 @@ export type ReasoningParseResult = {
   isOpen: boolean;
 };
 
-// Ordered from most common to least; the earliest opening tag wins.
+// Ordered from most specific to least; the earliest opening tag wins.
+// Longer variants (e.g. `<thinking>`) are matched before their prefixes
+// (`<think`) so closing tags like `</thinking>` resolve correctly instead of
+// leaving the block permanently "open" and swallowing the final answer.
 const REASONING_TAGS: { open: string; close: string }[] = [
-  { open: "<think", close: "</think>" },
+  { open: "<thinking", close: "</thinking>" },
+  { open: "<reasoning", close: "</reasoning>" },
   { open: "<thought", close: "</thought>" },
+  { open: "<think", close: "</think>" },
 ];
 
 /**
@@ -92,4 +97,24 @@ export function parseReasoning(
   }
 
   return { reasoning, cleanText, isOpen };
+}
+
+/**
+ * Removes the first reasoning opening tag from a string. Used as a fallback when
+ * a reasoning tag opened but never closed (so we can surface the text as a
+ * normal answer instead of hiding it behind the accordion).
+ */
+export function stripOpenReasoningTag(text: string): string {
+  const source = text ?? "";
+  for (const tag of REASONING_TAGS) {
+    const idx = source.indexOf(tag.open);
+    if (idx !== -1) {
+      const openEnd = source.indexOf(">", idx);
+      if (openEnd !== -1) {
+        return source.slice(0, idx) + source.slice(openEnd + 1);
+      }
+      return source.slice(0, idx) + source.slice(idx + tag.open.length);
+    }
+  }
+  return source;
 }

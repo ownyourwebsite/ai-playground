@@ -19,8 +19,9 @@ import SettingsModal from "@/components/SettingsModal";
 import { getSession, saveSession } from "@/lib/db";
 import { callMcpTool } from "@/lib/mcp/client";
 import { resolveGithubToolArgs, validateToolArgs } from "@/lib/mcp/utils";
-import { parseReasoning } from "@/lib/reasoning";
+import { parseReasoning, stripOpenReasoningTag } from "@/lib/reasoning";
 import ReasoningAccordion from "@/components/ReasoningAccordion";
+import Markdown from "@/components/Markdown";
 import { Message, McpServer, McpTool, ToolInvocation, ChatRequestTool, AppSettings, SavedProvider, ChatRequestBody } from "@/lib/types";
 
 function WorkspaceContent() {
@@ -194,7 +195,21 @@ function WorkspaceContent() {
             }
             return m;
           });
-          setMessages(prunedMessages);
+          // Migrate old messages where an unclosed reasoning tag stored the whole
+          // reply inside `reasoning` and left `content` empty (answer hidden under
+          // the accordion). Surface it back as the visible answer.
+          const migratedMessages = prunedMessages.map((m: Message) => {
+            if (m.role === "assistant" && m.reasoningOpen) {
+              return {
+                ...m,
+                content: m.content || (m.reasoning || ""),
+                reasoning: m.content ? m.reasoning : null,
+                reasoningOpen: false,
+              };
+            }
+            return m;
+          });
+          setMessages(migratedMessages);
         }
       } else {
         setMessages([
@@ -577,12 +592,16 @@ function WorkspaceContent() {
 
       setIsLoading(false);
       const parsedFinal = parseReasoning(assistantContent);
+      // If a reasoning tag opened but never closed, it wasn't valid reasoning
+      // markup — surface the whole reply as the answer instead of hiding it
+      // behind the "Thought process" accordion.
+      const reasoningUnclosed = parsedFinal.isOpen;
       const finalAssistant: Message = {
         id: assistantMessageId,
         role: "assistant",
-        content: parsedFinal.cleanText,
-        reasoning: parsedFinal.reasoning,
-        reasoningOpen: parsedFinal.isOpen,
+        content: reasoningUnclosed ? stripOpenReasoningTag(assistantContent) : parsedFinal.cleanText,
+        reasoning: reasoningUnclosed ? null : parsedFinal.reasoning,
+        reasoningOpen: false,
         toolInvocations,
         ...(streamError ? { error: streamError } : {}),
       };
@@ -685,8 +704,11 @@ function WorkspaceContent() {
       const activeServ = mcpServers.find((s: McpServer) => s.id === serverId) || mcpServers.find((s: McpServer) => s.status === "connected");
       if (!activeServ) throw new Error(`No active MCP server found for tool ${toolCall.toolName}.`);
 
-      const token = activeServ.preset === "github" ? settings.githubPat : undefined;
-      const result = await callMcpTool(activeServ.url, token, originalName, args);
+      const authHeaders: Record<string, string> =
+        activeServ.preset === "github" && settings.githubPat
+          ? { Authorization: `Bearer ${settings.githubPat}` }
+          : activeServ.headers || {};
+      const result = await callMcpTool(activeServ.url, authHeaders, originalName, args);
 
       setMessages((prev: Message[]) => {
         const newMessages = prev.map((m: Message) => {
@@ -896,7 +918,13 @@ function WorkspaceContent() {
                           />
                         )}
                         {parsed.cleanText && (
-                          <div className="whitespace-pre-wrap break-words">{parsed.cleanText}</div>
+                          <div className="whitespace-pre-wrap break-words">
+                            {msg.role === "assistant" ? (
+                              <Markdown text={parsed.cleanText} />
+                            ) : (
+                              parsed.cleanText
+                            )}
+                          </div>
                         )}
                       </>
                     );

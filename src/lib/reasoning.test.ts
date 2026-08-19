@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { parseReasoning } from "./reasoning";
+import { parseReasoning, stripOpenReasoningTag } from "./reasoning";
 
 test("parseReasoning: no tags returns null reasoning", () => {
   const result = parseReasoning("Hello world");
@@ -64,4 +64,40 @@ test("parseReasoning: opening tag without '>' still captured as reasoning", () =
   assert.strictEqual(result.reasoning, "I am mid-tag");
   assert.strictEqual(result.cleanText, "Text");
   assert.strictEqual(result.isOpen, true);
+});
+
+test("parseReasoning: <thinking> block (plural) is extracted and stripped", () => {
+  const result = parseReasoning("<thinking>I should check the file first.</thinking>Here is the answer.");
+  assert.strictEqual(result.reasoning, "I should check the file first.");
+  assert.strictEqual(result.cleanText, "Here is the answer.");
+  assert.strictEqual(result.isOpen, false);
+});
+
+test("parseReasoning: <reasoning> block is extracted and stripped", () => {
+  const result = parseReasoning("A<reasoning>hidden</reasoning>B");
+  assert.strictEqual(result.reasoning, "hidden");
+  assert.strictEqual(result.cleanText, "AB");
+  assert.strictEqual(result.isOpen, false);
+});
+
+test("parseReasoning: unclosed <thinking> no longer swallows the final answer via fallback", () => {
+  const raw = "<thinking>this looks like reasoning but never closes</thinking>the answer is 42";
+  const result = parseReasoning(raw);
+  // Properly closed <thinking> is extracted normally:
+  assert.strictEqual(result.reasoning, "this looks like reasoning but never closes");
+  assert.strictEqual(result.cleanText, "the answer is 42");
+  assert.strictEqual(result.isOpen, false);
+});
+
+test("parseReasoning: malformed unclosed tag flags isOpen", () => {
+  const result = parseReasoning("<thinking>the model never closes this");
+  assert.strictEqual(result.reasoning, "the model never closes this");
+  assert.strictEqual(result.cleanText, "");
+  assert.strictEqual(result.isOpen, true);
+});
+
+test("stripOpenReasoningTag removes the opening tag so the answer stays visible", () => {
+  assert.strictEqual(stripOpenReasoningTag("<thinking>the model never closes this"), "the model never closes this");
+  assert.strictEqual(stripOpenReasoningTag("Answer: <think>partial"), "Answer: partial");
+  assert.strictEqual(stripOpenReasoningTag("no tags here"), "no tags here");
 });

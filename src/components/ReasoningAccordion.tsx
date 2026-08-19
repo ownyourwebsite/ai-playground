@@ -23,7 +23,7 @@ export default function ReasoningAccordion({ reasoning, isStreaming = false }: R
   const hasContent = !!reasoning;
 
   return (
-    <div className="mb-3 rounded-xl border border-border/60 bg-muted/30 overflow-hidden">
+    <div className="mb-1.5 rounded-xl border border-border/60 bg-muted/30 overflow-hidden">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -38,9 +38,8 @@ export default function ReasoningAccordion({ reasoning, isStreaming = false }: R
           )}
         </span>
         <ChevronDown
-          className={`w-4 h-4 text-muted-foreground transition-transform duration-200 shrink-0 ${
-            open ? "rotate-180" : ""
-          }`}
+          className={`w-4 h-4 text-muted-foreground transition-transform duration-200 shrink-0 ${open ? "rotate-180" : ""
+            }`}
         />
       </button>
 

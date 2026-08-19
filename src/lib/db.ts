@@ -120,6 +120,12 @@ export async function saveMcpServer(server: McpServerConfig): Promise<void> {
   await db.put('mcpServers', server);
 }
 
+export async function deleteMcpServer(id: string): Promise<void> {
+  const db = await getDB();
+  if (!db) return;
+  await db.delete('mcpServers', id);
+}
+
 export async function getSettings(): Promise<AppSettings | undefined> {
   const db = await getDB();
   if (!db) return undefined;

@@ -14,14 +14,11 @@ type JsonRpcResponse = {
 
 export async function sendMcpRequest(
   url: string,
-  token: string | undefined,
+  authHeaders: Record<string, string> | undefined,
   method: string,
   params: Record<string, unknown> = {}
 ): Promise<unknown> {
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
+  const headers: Record<string, string> = { ...(authHeaders || {}) };
 
   const response = await fetch("/api/mcp", {
     method: "POST",
@@ -54,8 +51,8 @@ export async function sendMcpRequest(
   return data.result;
 }
 
-export async function initializeMcp(url: string, token: string | undefined): Promise<unknown> {
-  return sendMcpRequest(url, token, "initialize", {
+export async function initializeMcp(url: string, authHeaders?: Record<string, string>): Promise<unknown> {
+  return sendMcpRequest(url, authHeaders, "initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
     clientInfo: {
@@ -65,18 +62,18 @@ export async function initializeMcp(url: string, token: string | undefined): Pro
   });
 }
 
-export async function listMcpTools(url: string, token: string | undefined): Promise<McpTool[]> {
-  const result = (await sendMcpRequest(url, token, "tools/list", {})) as { tools?: McpTool[] } | null;
+export async function listMcpTools(url: string, authHeaders?: Record<string, string>): Promise<McpTool[]> {
+  const result = (await sendMcpRequest(url, authHeaders, "tools/list", {})) as { tools?: McpTool[] } | null;
   return result?.tools || [];
 }
 
 export async function callMcpTool(
   url: string,
-  token: string | undefined,
+  authHeaders: Record<string, string> | undefined,
   name: string,
   args: Record<string, unknown>
 ): Promise<McpCallResult> {
-  return (await sendMcpRequest(url, token, "tools/call", {
+  return (await sendMcpRequest(url, authHeaders, "tools/call", {
     name,
     arguments: args,
   })) as McpCallResult;
