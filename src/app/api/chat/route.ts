@@ -1,4 +1,5 @@
 import { streamText, jsonSchema, ModelMessage, LanguageModel, JSONSchema7, TextPart, ToolCallPart, ToolResultPart } from 'ai';
+import { checkRateLimit } from '@/lib/rateLimit';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOllama } from 'ollama-ai-provider';
@@ -55,6 +56,11 @@ type IncomingTool = {
 };
 
 export async function POST(req: Request) {
+  const rl = await checkRateLimit(req, "chat");
+  if (!rl.allowed) {
+    return new Response(JSON.stringify({ error: "Rate limit exceeded. Try again in a minute." }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } });
+  }
+
   try {
     const { messages, provider, model, systemPrompt, ollamaUrl, enabledTools, githubContext } = await req.json();
 

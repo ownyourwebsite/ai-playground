@@ -3,7 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from "react";
 import { Session, AppSettings, McpServer, McpServerConfig, ChatRequestBody, Message } from "@/lib/types";
 import { getSessions, getSettings, saveSettings, getMcpServers, saveMcpServer, deleteMcpServer } from "@/lib/db";
-import { initializeMcp, listMcpTools, McpTool } from "@/lib/mcp/client";
+import { initializeMcp, listMcpTools, clearMcpSession, McpTool } from "@/lib/mcp/client";
 
 const DEFAULT_SETTINGS: AppSettings = {
   id: "default",
@@ -180,6 +180,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           const authHeaders: Record<string, string> = loadedSettings.githubPat
             ? { Authorization: `Bearer ${loadedSettings.githubPat}` }
             : {};
+          // A stale session from a previous run may no longer be valid
+          clearMcpSession(githubServer.url);
           await initializeMcp(githubServer.url, authHeaders);
           const tools = await listMcpTools(githubServer.url, authHeaders);
 

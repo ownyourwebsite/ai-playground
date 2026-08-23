@@ -16,7 +16,7 @@ import {
   Save,
 } from "lucide-react";
 import { useWorkspace } from "@/context/WorkspaceContext";
-import { initializeMcp, listMcpTools, callMcpTool, McpTool } from "@/lib/mcp/client";
+import { initializeMcp, listMcpTools, callMcpTool, clearMcpSession, McpTool } from "@/lib/mcp/client";
 import { resolveGithubToolArgs } from "@/lib/mcp/utils";
 import { generateCurl, generateTypeScript } from "@/lib/export/snippet";
 import { McpServer } from "@/lib/types";
@@ -113,6 +113,8 @@ export default function RightPanel() {
     setConnectingServerId(server.id);
     try {
       const authHeaders = getAuthHeaders(server);
+      // A stale session may exist if this server was connected before
+      clearMcpSession(server.url);
       await initializeMcp(server.url, authHeaders);
       const tools = await listMcpTools(server.url, authHeaders);
 

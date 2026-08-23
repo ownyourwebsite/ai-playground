@@ -12,13 +12,35 @@ type JsonRpcResponse = {
   error?: { message?: string } | string;
 };
 
+// Session ids issued by stateful Streamable HTTP MCP servers via the
+// "mcp-session-id" response header on initialize, keyed by server URL.
+const sessionIds = new Map<string, string>();
+
+export function clearMcpSession(url: string): void {
+  sessionIds.delete(url);
+}
+
 export async function sendMcpRequest(
   url: string,
   authHeaders: Record<string, string> | undefined,
   method: string,
-  params: Record<string, unknown> = {}
+  params?: Record<string, unknown>
 ): Promise<unknown> {
   const headers: Record<string, string> = { ...(authHeaders || {}) };
+
+  const sessionId = sessionIds.get(url);
+  if (sessionId) {
+    headers["mcp-session-id"] = sessionId;
+  }
+
+  // JSON-RPC notifications (e.g. "notifications/initialized") carry no id,
+  // and their params may be omitted entirely.
+  const isNotification = params === undefined && method.startsWith("notifications/");
+  const rpcBody: Record<string, unknown> = { jsonrpc: "2.0", method };
+  if (!isNotification) {
+    rpcBody.id = Math.floor(Math.random() * 1000000);
+    rpcBody.params = params ?? {};
+  }
 
   const response = await fetch("/api/mcp", {
     method: "POST",
@@ -29,12 +51,7 @@ export async function sendMcpRequest(
       url,
       method: "POST",
       headers,
-      body: {
-        jsonrpc: "2.0",
-        id: Math.floor(Math.random() * 1000000),
-        method,
-        params,
-      },
+      body: rpcBody,
     }),
   });
 
@@ -43,7 +60,26 @@ export async function sendMcpRequest(
     throw new Error(errData.error || `Proxy error: ${response.status} ${response.statusText}`);
   }
 
-  const data = (await response.json()) as JsonRpcResponse;
+  // Persist the session id (if any) for subsequent requests to this server.
+  const newSessionId = response.headers.get("mcp-session-id");
+  if (newSessionId) {
+    sessionIds.set(url, newSessionId);
+  }
+
+  // Notifications may be answered with an empty or non-JSON body (e.g. 202 Accepted).
+  const responseText = await response.text();
+  if (!responseText.trim()) {
+    return undefined;
+  }
+  let data: JsonRpcResponse;
+  try {
+    data = JSON.parse(responseText) as JsonRpcResponse;
+  } catch {
+    if (response.status >= 200 && response.status < 300) {
+      return undefined;
+    }
+    throw new Error(`Proxy returned invalid JSON: ${response.status} ${response.statusText}`);
+  }
   if (data.error) {
     throw new Error(typeof data.error === "string" ? data.error : data.error.message || JSON.stringify(data.error));
   }
@@ -51,8 +87,12 @@ export async function sendMcpRequest(
   return data.result;
 }
 
+export async function notifyInitialized(url: string, authHeaders?: Record<string, string>): Promise<void> {
+  await sendMcpRequest(url, authHeaders, "notifications/initialized");
+}
+
 export async function initializeMcp(url: string, authHeaders?: Record<string, string>): Promise<unknown> {
-  return sendMcpRequest(url, authHeaders, "initialize", {
+  const result = await sendMcpRequest(url, authHeaders, "initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
     clientInfo: {
@@ -60,6 +100,16 @@ export async function initializeMcp(url: string, authHeaders?: Record<string, st
       version: "1.0.0",
     },
   });
+
+  // Per the MCP spec, the client MUST send notifications/initialized after
+  // a successful initialize. A failure here must not break the connection.
+  try {
+    await notifyInitialized(url, authHeaders);
+  } catch (err) {
+    console.warn("Failed to send notifications/initialized:", err instanceof Error ? err.message : String(err));
+  }
+
+  return result;
 }
 
 export async function listMcpTools(url: string, authHeaders?: Record<string, string>): Promise<McpTool[]> {

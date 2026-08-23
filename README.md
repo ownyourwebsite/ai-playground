@@ -14,7 +14,7 @@ A developer-first, local-first LLM playground that integrates the Model Context 
 *   **Human-in-the-loop (HITL):** All MCP tool calls require manual user approval before execution, ensuring full control over what actions the LLM takes on your behalf.
 *   **GitHub Write Mode:** Toggle write actions (create/update/delete) for the GitHub MCP to save prompt tokens and fit within lower-tier model limits.
 *   **Dynamic Provider & Model Selection:** Define custom model strings for any popular provider, or add entirely custom Base URLs directly in the settings. The UI dynamically detects your configured keys and offers them as selectable models without manual toggling.
-*   **Local-First / Private:** All keys, prompt templates, and chat histories are stored inside your browser's **IndexedDB**. Secrets are only kept in-memory or persisted locally if explicitly requested. Nothing is ever sent to our servers.
+*   **Local-First / Private:** All keys, prompt templates, and chat histories are stored inside your browser's **IndexedDB**. Keys are held in memory and forwarded per-request to the model provider — they are never persisted server-side.
 *   **Real-time Streaming & Metrics:** Smooth stream processing for all providers. Track estimated token usage (including MCP schema overhead) and API latency in real-time.
 *   **Hosted MCP Presets (GitHub):** Wire up the official hosted GitHub copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`) natively using your GitHub PAT.
 *   **Custom remote MCPs:** Proxy JSON-RPC requests safely using an SSRF-shielded HTTP proxy.
@@ -27,6 +27,7 @@ A developer-first, local-first LLM playground that integrates the Model Context 
 ### 1. Run the App Locally
 ```bash
 npm install
+cp .env.example .env.local   # optional: configure environment variables (see below)
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) to view the workspace.
@@ -85,6 +86,22 @@ adding it directly in the right sidebar.
 
 ---
 
+## ⚙️ Environment Variables
+
+All environment variables are **optional** — the app works out of the box with an empty `.env.local`. See [`.env.example`](.env.example) for placeholders.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ALLOW_PRIVATE_MCP` | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy. **Never enable this on a publicly deployed instance** (e.g. Vercel). |
+| `UPSTASH_REDIS_REST_URL` | _(empty)_ | Upstash Redis REST endpoint. If both Upstash variables are empty, rate limiting is fully disabled. Create a free database at [upstash.com](https://upstash.com) → Redis → REST API details. |
+| `UPSTASH_REDIS_REST_TOKEN` | _(empty)_ | Upstash Redis REST token (kept server-side only). |
+| `RATE_LIMIT_CHAT_PER_MINUTE` | `20` | Chat requests per minute per IP. |
+| `RATE_LIMIT_MCP_PER_MINUTE` | `60` | MCP proxy requests per minute per IP. |
+
+> **Rate limiting** activates automatically as soon as both Upstash variables are set — no code changes needed. It is implemented against the Upstash REST API with zero extra npm dependencies and **fails open** if Redis is unreachable. For public deployments (e.g. Vercel), enabling it is recommended.
+
+---
+
 ## 📚 Documentation
 
 - **[Contributing Guide](CONTRIBUTING.md)** - How to contribute to this project
@@ -109,3 +126,4 @@ This playground is an open-source tool built and maintained by OwnYourWebsite - 
 Main Ecosystem: ownyourwebsite.app
 
 Live Playground: ai-playground.ownyourwebsite.app
+

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isIP } from "net";
+import { lookup } from "dns/promises";
+import { checkRateLimit } from "@/lib/rateLimit";
+
+export const runtime = "nodejs";
 
 const ALLOW_PRIVATE_MCP = process.env.ALLOW_PRIVATE_MCP === "1";
 
@@ -26,7 +30,7 @@ function isPrivateIPAddress(ip: string): boolean {
   return false;
 }
 
-function isUrlSsrfSafe(urlStr: string): boolean {
+async function isUrlSsrfSafe(urlStr: string): Promise<boolean> {
   try {
     const url = new URL(urlStr);
 
@@ -39,13 +43,39 @@ function isUrlSsrfSafe(urlStr: string): boolean {
       return true;
     }
 
-    const hostname = url.hostname;
+    let hostname = url.hostname;
+
+    // Strip brackets from IPv6 literals, e.g. "[::1]" -> "::1"
+    if (hostname.startsWith("[") && hostname.endsWith("]")) {
+      hostname = hostname.slice(1, -1);
+    }
+
     if (isPrivateHostname(hostname)) {
+      return false;
+    }
+
+    // Reject non-dotted numeric hostnames (decimal like "2130706433" or hex
+    // like "0x7f000001"): only dotted IPv4 and regular domains are allowed.
+    if (/^\d+$/.test(hostname) || /^0x[0-9a-f]+$/i.test(hostname)) {
       return false;
     }
 
     if (isIP(hostname)) {
       return !isPrivateIPAddress(hostname);
+    }
+
+    // DNS resolution check: a public-looking domain may resolve to a private
+    // or link-local address (DNS rebinding / 169.254.169.254 metadata).
+    try {
+      const addresses = await lookup(hostname, { all: true });
+      for (const addr of addresses) {
+        if (isPrivateIPAddress(addr.address)) {
+          return false;
+        }
+      }
+    } catch {
+      // Cannot resolve the host - treat as unsafe
+      return false;
     }
 
     return true;
@@ -55,6 +85,11 @@ function isUrlSsrfSafe(urlStr: string): boolean {
 }
 
 export async function POST(req: NextRequest) {
+  const rl = await checkRateLimit(req, "mcp");
+  if (!rl.allowed) {
+    return new Response(JSON.stringify({ error: "Rate limit exceeded. Try again in a minute." }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } });
+  }
+
   try {
     const { url, method = "POST", headers = {}, body } = await req.json();
 
@@ -62,7 +97,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing url parameter" }, { status: 400 });
     }
 
-    if (!isUrlSsrfSafe(url)) {
+    if (!(await isUrlSsrfSafe(url))) {
       return NextResponse.json({ error: "Access to private or non-HTTPS URLs is restricted" }, { status: 403 });
     }
 
@@ -71,6 +106,12 @@ export async function POST(req: NextRequest) {
       "Content-Type": "application/json",
       "Accept": "application/json, text/event-stream",
     };
+
+    // Forward the MCP session id (stateful Streamable HTTP servers)
+    const incomingSessionId = req.headers.get("mcp-session-id");
+    if (incomingSessionId) {
+      safeHeaders["mcp-session-id"] = incomingSessionId;
+    }
 
     for (const [key, val] of Object.entries(headers)) {
       if (typeof val === "string") {
@@ -136,11 +177,19 @@ export async function POST(req: NextRequest) {
         }
       }
 
+      const responseHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+
+      // Pass the MCP session id back to the client so it can reuse it
+      const upstreamSessionId = response.headers.get("mcp-session-id");
+      if (upstreamSessionId) {
+        responseHeaders["mcp-session-id"] = upstreamSessionId;
+      }
+
       return new NextResponse(JSON.stringify(responseJson), {
         status: response.status,
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: responseHeaders,
       });
     } catch (err: unknown) {
       clearTimeout(timeoutId);

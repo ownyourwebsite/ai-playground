@@ -19,6 +19,7 @@ import SettingsModal from "@/components/SettingsModal";
 import { getSession, saveSession } from "@/lib/db";
 import { callMcpTool } from "@/lib/mcp/client";
 import { resolveGithubToolArgs, validateToolArgs } from "@/lib/mcp/utils";
+import { filterGithubTools } from "@/lib/mcp/githubTools";
 import { parseReasoning, stripOpenReasoningTag } from "@/lib/reasoning";
 import ReasoningAccordion from "@/components/ReasoningAccordion";
 import Markdown from "@/components/Markdown";
@@ -92,9 +93,8 @@ function WorkspaceContent() {
   let allEnabledToolsList: McpTool[] = [];
   activeServers.forEach((server: McpServer) => {
     let serverTools = server.tools || [];
-    if (server.preset === "github" && settings.githubWriteMode === false) {
-      const writeKeywords = ["create", "update", "delete", "modify", "set", "push", "write"];
-      serverTools = serverTools.filter((t: McpTool) => !writeKeywords.some(kw => t.name.includes(kw)));
+    if (server.preset === "github") {
+      serverTools = filterGithubTools(server.tools || [], settings.githubWriteMode === true);
     }
     allEnabledToolsList = [...allEnabledToolsList, ...serverTools];
   });
@@ -383,10 +383,9 @@ function WorkspaceContent() {
     activeServers.forEach((server: McpServer) => {
       let serverTools = server.tools || [];
 
-      // Filter out write tools if "GitHub write mode" is off
-      if (server.preset === "github" && currentSettings.githubWriteMode === false) {
-        const writeKeywords = ["create", "update", "delete", "modify", "set", "push", "write"];
-        serverTools = serverTools.filter((t: McpTool) => !writeKeywords.some(kw => t.name.includes(kw)));
+      // Allow-list read-only tools unless "GitHub write mode" is explicitly on
+      if (server.preset === "github") {
+        serverTools = filterGithubTools(server.tools || [], currentSettings.githubWriteMode === true);
       }
 
       // Namespace tools if more than one server is active
@@ -701,7 +700,8 @@ function WorkspaceContent() {
       const originalName = toolDef?.originalName || toolCall.toolName;
       const serverId = toolDef?.serverId;
 
-      const activeServ = mcpServers.find((s: McpServer) => s.id === serverId) || mcpServers.find((s: McpServer) => s.status === "connected");
+      // Strict: the tool must run ONLY on its own connected server, no fallback
+      const activeServ = mcpServers.find((s: McpServer) => s.id === serverId && s.status === "connected");
       if (!activeServ) throw new Error(`No active MCP server found for tool ${toolCall.toolName}.`);
 
       const authHeaders: Record<string, string> =
