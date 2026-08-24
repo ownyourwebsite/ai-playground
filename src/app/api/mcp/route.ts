@@ -1,168 +1,135 @@
 import { NextRequest, NextResponse } from "next/server";
-import { isIP } from "net";
-import { lookup } from "dns/promises";
 import { checkRateLimit } from "@/lib/rateLimit";
+import { ssrfGuardedFetch, assertUrlIsPublic } from "@/lib/ssrf";
 
 export const runtime = "nodejs";
 
-const ALLOW_PRIVATE_MCP = process.env.ALLOW_PRIVATE_MCP === "1";
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10MB
+const UPSTREAM_TIMEOUT_MS = 15000;
 
-function isPrivateHostname(hostname: string): boolean {
-  if (hostname === "localhost" || hostname.endsWith(".local") || hostname.endsWith(".internal")) {
-    return true;
-  }
-  return false;
-}
+// MCP Streamable HTTP only needs these methods.
+const ALLOWED_METHODS = new Set(["GET", "POST", "DELETE"]);
 
-function isPrivateIPAddress(ip: string): boolean {
-  const parts = ip.split(".").map(Number);
-  if (parts.length === 4) {
-    if (parts[0] === 10) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    if (parts[0] === 0) return true;
-  }
-  if (ip === "::1" || ip === "::") return true;
-  if (ip.startsWith("fe80:")) return true;
-  if (ip.startsWith("fc00:") || ip.startsWith("fd00:")) return true;
-  return false;
-}
+/**
+ * Hop-by-hop and dangerous headers are never forwarded from the client body
+ * to the upstream server. `mcp-session-id` is forwarded separately from the
+ * incoming request headers to avoid spoofing/conflicts.
+ */
+const BLOCKED_HEADERS = new Set([
+  // Hop-by-hop
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  // Framing / routing
+  "content-length",
+  "expect",
+  "mcp-session-id",
+]);
 
-async function isUrlSsrfSafe(urlStr: string): Promise<boolean> {
-  try {
-    const url = new URL(urlStr);
-
-    // Hosted playground must use https unless ALLOW_PRIVATE_MCP=1
-    if (url.protocol !== "https:" && !ALLOW_PRIVATE_MCP) {
-      return false;
-    }
-
-    if (ALLOW_PRIVATE_MCP) {
-      return true;
-    }
-
-    let hostname = url.hostname;
-
-    // Strip brackets from IPv6 literals, e.g. "[::1]" -> "::1"
-    if (hostname.startsWith("[") && hostname.endsWith("]")) {
-      hostname = hostname.slice(1, -1);
-    }
-
-    if (isPrivateHostname(hostname)) {
-      return false;
-    }
-
-    // Reject non-dotted numeric hostnames (decimal like "2130706433" or hex
-    // like "0x7f000001"): only dotted IPv4 and regular domains are allowed.
-    if (/^\d+$/.test(hostname) || /^0x[0-9a-f]+$/i.test(hostname)) {
-      return false;
-    }
-
-    if (isIP(hostname)) {
-      return !isPrivateIPAddress(hostname);
-    }
-
-    // DNS resolution check: a public-looking domain may resolve to a private
-    // or link-local address (DNS rebinding / 169.254.169.254 metadata).
-    try {
-      const addresses = await lookup(hostname, { all: true });
-      for (const addr of addresses) {
-        if (isPrivateIPAddress(addr.address)) {
-          return false;
-        }
-      }
-    } catch {
-      // Cannot resolve the host - treat as unsafe
-      return false;
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
+function jsonError(message: string, status: number, extraHeaders?: Record<string, string>) {
+  return new NextResponse(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+  });
 }
 
 export async function POST(req: NextRequest) {
   const rl = await checkRateLimit(req, "mcp");
   if (!rl.allowed) {
-    return new Response(JSON.stringify({ error: "Rate limit exceeded. Try again in a minute." }), { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "60" } });
+    return jsonError("Rate limit exceeded. Try again in a minute.", 429, { "Retry-After": "60" });
   }
 
   try {
     const { url, method = "POST", headers = {}, body } = await req.json();
 
-    if (!url) {
-      return NextResponse.json({ error: "Missing url parameter" }, { status: 400 });
+    if (!url || typeof url !== "string") {
+      return jsonError("Missing url parameter", 400);
     }
 
-    if (!(await isUrlSsrfSafe(url))) {
-      return NextResponse.json({ error: "Access to private or non-HTTPS URLs is restricted" }, { status: 403 });
+    if (!ALLOWED_METHODS.has(method)) {
+      return jsonError(`Method ${method} is not allowed`, 405);
     }
 
-    // Prepare headers, strip dangerous ones, don't log them
+
+    // Full SSRF validation (protocol, private hosts/IPs, DNS resolution).
+    // Throws a safe error message when the target is not allowed.
+    try {
+      await assertUrlIsPublic(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "URL is not allowed";
+      return jsonError(message, 403);
+    }
+
+    // Prepare headers: safe defaults, then user-supplied headers minus the
+    // blocked (hop-by-hop / framing) ones. Values must be header-safe.
     const safeHeaders: Record<string, string> = {
       "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
+      Accept: "application/json, text/event-stream",
     };
 
-    // Forward the MCP session id (stateful Streamable HTTP servers)
+    for (const [key, val] of Object.entries(headers)) {
+      if (
+        typeof val === "string" &&
+        val.length <= 4096 &&
+        !/[\r\n]/.test(val) &&
+        !BLOCKED_HEADERS.has(key.toLowerCase())
+      ) {
+        safeHeaders[key] = val;
+      }
+    }
+
+    // Forward the MCP session id (stateful Streamable HTTP servers). The
+    // request header wins over anything supplied in the JSON body.
     const incomingSessionId = req.headers.get("mcp-session-id");
-    if (incomingSessionId) {
+    if (incomingSessionId && !/[\r\n]/.test(incomingSessionId)) {
       safeHeaders["mcp-session-id"] = incomingSessionId;
     }
 
-    for (const [key, val] of Object.entries(headers)) {
-      if (typeof val === "string") {
-        const lowerKey = key.toLowerCase();
-        if (lowerKey !== "host" && lowerKey !== "connection") {
-          safeHeaders[key] = val;
-        }
-      }
-    }
-
-    // Implement fetch with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 10-15s timeout
-
     try {
-      const response = await fetch(url, {
+      const response = await ssrfGuardedFetch(url, {
         method,
         headers: safeHeaders,
-        body: method !== "GET" && method !== "HEAD" ? JSON.stringify(body) : undefined,
-        redirect: "manual", // Prevent following redirects to avoid SSRF
-        signal: controller.signal,
+        body: method !== "GET" && method !== "HEAD" ? JSON.stringify(body ?? null) : undefined,
+        timeoutMs: UPSTREAM_TIMEOUT_MS,
+        maxBytes: MAX_RESPONSE_BYTES,
       });
 
-      clearTimeout(timeoutId);
-
-      if (response.status === 301 || response.status === 302 || response.status === 307 || response.status === 308) {
-        return NextResponse.json({ error: "Redirects are blocked for security" }, { status: 502 });
+      if (response.status >= 300 && response.status < 400) {
+        return jsonError("Redirects are blocked for security", 502);
       }
 
-      // Check max body size
-      const contentLength = response.headers.get("content-length");
-      if (contentLength && parseInt(contentLength, 10) > 10 * 1024 * 1024) { // 10MB limit
-        return NextResponse.json({ error: "Response payload too large" }, { status: 413 });
+      if (response.truncated) {
+        return jsonError("Response payload too large", 413);
       }
 
-      const responseText = await response.text();
+      const responseText = response.bodyText;
       let responseJson;
       try {
         responseJson = JSON.parse(responseText);
       } catch {
         // Try parsing SSE (Server-Sent Events) format
         // Typically: data: {"jsonrpc":"2.0",...}
-        const dataLines = responseText.split("\n")
-          .filter(line => line.trim().startsWith("data:"))
-          .map(line => line.trim().substring(5).trim());
+        const dataLines = responseText
+          .split("\n")
+          .filter((line) => line.trim().startsWith("data:"))
+          .map((line) => line.trim().substring(5).trim());
 
         if (dataLines.length > 0) {
           for (const dataLine of dataLines) {
             try {
               const parsed = JSON.parse(dataLine);
-              if (parsed && typeof parsed === "object" && (parsed.jsonrpc === "2.0" || parsed.result || parsed.error)) {
+              if (
+                parsed &&
+                typeof parsed === "object" &&
+                (parsed.jsonrpc === "2.0" || parsed.result || parsed.error)
+              ) {
                 responseJson = parsed;
                 break;
               }
@@ -182,8 +149,8 @@ export async function POST(req: NextRequest) {
       };
 
       // Pass the MCP session id back to the client so it can reuse it
-      const upstreamSessionId = response.headers.get("mcp-session-id");
-      if (upstreamSessionId) {
+      const upstreamSessionId = response.headers["mcp-session-id"];
+      if (typeof upstreamSessionId === "string" && !/[\r\n]/.test(upstreamSessionId)) {
         responseHeaders["mcp-session-id"] = upstreamSessionId;
       }
 
@@ -192,15 +159,21 @@ export async function POST(req: NextRequest) {
         headers: responseHeaders,
       });
     } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      const error = err as { name?: string; message?: string };
-      if (error.name === "AbortError") {
-        return NextResponse.json({ error: "Gateway Timeout" }, { status: 504 });
+      const error = err as { code?: string; message?: string };
+      if (error.message === "Gateway timeout") {
+        return jsonError("Gateway Timeout", 504);
       }
-      return NextResponse.json({ error: `Connection failed: ${error.message}` }, { status: 502 });
+      if (error.message === "Response payload too large") {
+        return jsonError("Response payload too large", 413);
+      }
+      if (error.code === "EBLOCKED" || error.message?.includes("private")) {
+        return jsonError("Access to private or non-HTTPS URLs is restricted", 403);
+      }
+      return jsonError(`Connection failed: ${error.message}`, 502);
     }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: message }, { status: 500 });
+    return jsonError(message, 500);
   }
 }
+

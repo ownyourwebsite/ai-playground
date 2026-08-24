@@ -1,5 +1,6 @@
 import { streamText, jsonSchema, ModelMessage, LanguageModel, JSONSchema7, TextPart, ToolCallPart, ToolResultPart } from 'ai';
 import { checkRateLimit } from '@/lib/rateLimit';
+import { isUrlSsrfSafe } from '@/lib/ssrf';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOllama } from 'ollama-ai-provider';
@@ -48,11 +49,12 @@ type IncomingMessage = {
   content?: unknown;
   toolInvocations?: IncomingToolInvocation[];
 };
-
 type IncomingTool = {
   name: string;
   description?: string;
   inputSchema?: JsonSchemaNode;
+  /** Server id the tool came from (e.g. "github" for the GitHub preset). */
+  serverId?: string;
 };
 
 export async function POST(req: Request) {
@@ -92,7 +94,24 @@ export async function POST(req: Request) {
       const groq = createGroq({ apiKey: groqKey });
       languageModel = groq(model || 'qwen/qwen3.6-27b');
     } else if (provider === 'ollama') {
-      const ollama = createOllama({ baseURL: ollamaUrl || 'http://127.0.0.1:11434/api' });
+      const ollamaBase = ollamaUrl || 'http://127.0.0.1:11434/api';
+
+      // SSRF guard: on hosted deployments the baseURL comes from the request
+      // body, so without this check anyone could make the server talk to its
+      // own internal network (metadata endpoints, localhost services, ...).
+      // Local development (no VERCEL env) stays unrestricted so users can
+      // keep using their local Ollama out of the box.
+      if (process.env.VERCEL && process.env.ALLOW_PRIVATE_MCP !== '1') {
+        const safe = await isUrlSsrfSafe(ollamaBase);
+        if (!safe) {
+          return new Response(
+            JSON.stringify({ error: 'Ollama URL must be a public HTTPS endpoint on hosted deployments.' }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+
+      const ollama = createOllama({ baseURL: ollamaBase });
       languageModel = ollama(model || 'llama3') as unknown as LanguageModel;
     } else if (provider === 'custom') {
       const customProvider = createOpenAI({
@@ -186,15 +205,20 @@ export async function POST(req: Request) {
 
         let description = tool.description || 'No description provided';
 
-        // Check if it's a GitHub tool by looking for 'owner' or 'repo' in properties
-        const isGithubTool = schema.properties && ('owner' in schema.properties || 'repo' in schema.properties);
+        // GitHub tools are identified by their originating server (serverId),
+        // falling back to the owner/repo schema heuristic for clients that do
+        // not send serverId. The heuristic alone misfires on non-GitHub MCPs
+        // (GitLab/Gitea) whose tools also use owner/repo parameters.
+        const isGithubTool =
+          tool.serverId === 'github' ||
+          (!tool.serverId && !!schema.properties && ('owner' in schema.properties || 'repo' in schema.properties));
 
         if (isGithubTool && githubContext) {
           const repoNote = `\nRepository context is available: owner=${githubContext.owner}, repo=${githubContext.repo}.\nUse these exact argument keys. Required: ${schema.required?.join(', ') || 'none'}. ${tool.name === 'get_file_contents' ? 'For the repository README, path is README.md.' : ''}`;
           description += repoNote;
         }
 
-        if (tool.name === 'get_file_contents') {
+        if (process.env.NODE_ENV === 'development' && tool.name === 'get_file_contents') {
           console.log(`[Chat API] Sanitized Schema for ${tool.name}:`, JSON.stringify(schema));
         }
 

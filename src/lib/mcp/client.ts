@@ -7,6 +7,13 @@ export interface McpCallResult {
   isError?: boolean;
 }
 
+/**
+ * MCP protocol version negotiated during `initialize`. The official spec
+ * revision this client targets. Bump deliberately: servers must support the
+ * advertised version or respond with their own via negotiation.
+ */
+export const MCP_PROTOCOL_VERSION = "2024-11-05";
+
 type JsonRpcResponse = {
   result?: unknown;
   error?: { message?: string } | string;
@@ -93,7 +100,7 @@ export async function notifyInitialized(url: string, authHeaders?: Record<string
 
 export async function initializeMcp(url: string, authHeaders?: Record<string, string>): Promise<unknown> {
   const result = await sendMcpRequest(url, authHeaders, "initialize", {
-    protocolVersion: "2024-11-05",
+    protocolVersion: MCP_PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: {
       name: "ai-api-playground",

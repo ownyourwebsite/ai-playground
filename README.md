@@ -92,13 +92,15 @@ All environment variables are **optional** — the app works out of the box with
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ALLOW_PRIVATE_MCP` | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy. **Never enable this on a publicly deployed instance** (e.g. Vercel). |
+| `ALLOW_PRIVATE_MCP` | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy (and to allow a local Ollama URL on hosted deployments). **Never enable this on a publicly deployed instance** (e.g. Vercel). |
 | `UPSTASH_REDIS_REST_URL` | _(empty)_ | Upstash Redis REST endpoint. If both Upstash variables are empty, rate limiting is fully disabled. Create a free database at [upstash.com](https://upstash.com) → Redis → REST API details. |
 | `UPSTASH_REDIS_REST_TOKEN` | _(empty)_ | Upstash Redis REST token (kept server-side only). |
 | `RATE_LIMIT_CHAT_PER_MINUTE` | `20` | Chat requests per minute per IP. |
 | `RATE_LIMIT_MCP_PER_MINUTE` | `60` | MCP proxy requests per minute per IP. |
 
-> **Rate limiting** activates automatically as soon as both Upstash variables are set — no code changes needed. It is implemented against the Upstash REST API with zero extra npm dependencies and **fails open** if Redis is unreachable. For public deployments (e.g. Vercel), enabling it is recommended.
+> **Rate limiting** activates automatically as soon as both Upstash variables are set — no code changes needed. It is implemented against the Upstash REST API with zero extra npm dependencies and **fails open** if Redis is unreachable. Clients are identified by the `x-forwarded-for` / `x-real-ip` headers — make sure your reverse proxy (nginx, Caddy, …) **overwrites** these headers for untrusted requests, otherwise clients can spoof their rate-limit identity. For public deployments (e.g. Vercel), enabling it is recommended.
+
+> **Ollama URL protection:** on hosted deployments (detected via the `VERCEL` environment variable) a custom Ollama base URL must pass the same SSRF checks as MCP servers — it must be a public HTTPS endpoint. Locally this restriction does not apply, so `http://127.0.0.1:11434/api` keeps working out of the box. If you self-host on a VPS behind a reverse proxy and want the same protection there, restrict `/api/chat` bodies or set up equivalent network-level guards.
 
 ---
 
@@ -126,4 +128,3 @@ This playground is an open-source tool built and maintained by OwnYourWebsite - 
 Main Ecosystem: ownyourwebsite.app
 
 Live Playground: ai-playground.ownyourwebsite.app
-

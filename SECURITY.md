@@ -52,7 +52,29 @@ When reporting a security vulnerability, please include:
 - This application stores data locally in the user's browser (IndexedDB)
 - No user data is sent to external servers
 - API keys are only transmitted to the respective AI provider APIs
+- Keys saved with "Remember keys on this device" are stored **unencrypted** in IndexedDB — anyone with access to the browser profile can read them
 - Follow privacy-by-design principles in all contributions
+
+### Hosted Deployments & Token Passthrough
+
+The app is BYOK (Bring Your Own Key): API keys and GitHub PATs are entered by
+users in their browser and forwarded per-request. When using a **hosted
+instance** (e.g. the public demo), these credentials transit through that
+instance's server:
+
+- LLM keys are sent as request headers to `/api/chat` and forwarded to the
+  chosen provider.
+- MCP credentials (e.g. a GitHub PAT) are sent in proxied request headers via
+  `/api/mcp` and forwarded to the MCP server.
+
+If you operate a hosted instance, you are trusted with this traffic:
+
+- **Disable access-log logging of request headers** on your platform/CDN.
+- Do not add instrumentation that records `x-*-key` or `Authorization` headers.
+- Say so explicitly in your deployment's privacy notice.
+
+Self-hosting (fork + deploy your own instance) avoids this trust entirely and
+is recommended for sensitive tokens.
 
 ## 📋 Security-Related Configuration
 

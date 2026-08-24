@@ -423,7 +423,9 @@ function SettingsForm() {
               className="rounded border-input text-primary focus:ring-primary h-4 w-4"
             />
             <label htmlFor="rememberKeys" className="text-xs text-muted-foreground cursor-pointer">
-              Remember keys on this device (stored encrypted/local-first in IndexedDB)
+              Remember keys on this device (stored locally in your browser
+              IndexedDB as plain text — anyone with access to this device
+              profile can read them)
             </label>
           </div>
           <div className="text-[10px] text-amber-600 dark:text-amber-500 font-medium italic leading-snug">
@@ -448,8 +450,8 @@ function SettingsForm() {
                   type="button"
                   onClick={() => setTheme(value)}
                   className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${theme === value
-                      ? "bg-primary text-primary-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
                     }`}
                 >
                   <Icon className="w-3.5 h-3.5" />

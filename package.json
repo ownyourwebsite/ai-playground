@@ -1,11 +1,13 @@
 {
   "name": "ai-api-playground",
   "version": "0.1.0",
+  "license": "MIT",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint .",
+    "test": "tsx --test src/lib/reasoning.test.ts src/lib/mcp/utils.test.ts src/lib/ssrf.test.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.110",
@@ -30,6 +32,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.3.1",
     "tailwindcss": "^4",
+    "tsx": "^4.19.2",
     "typescript": "^5"
   }
 }

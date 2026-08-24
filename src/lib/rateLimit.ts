@@ -76,17 +76,16 @@ export async function checkRateLimit(
     const ip = getClientIP(req);
     const key = `ratelimit:${scope}:${ip}`;
     const limit = getLimitForScope(scope);
-
-    // Fixed window: INCR, then EXPIRE only when the counter was just created
-    // (result of INCR === 1), so the window restarts on every new minute slot.
-    const results = await upstashPipeline(url, token, [["INCR", key]]);
+    // Fixed window in a single atomic pipeline: INCR + EXPIRE NX. The "NX"
+    // flag makes EXPIRE idempotent (only sets TTL when none exists), so the
+    // window restarts on the first request of each new minute slot and a
+    // failed/partial pipeline can never leave a key without a TTL (which
+    // would lock the client out forever).
+    const results = await upstashPipeline(url, token, [
+      ["INCR", key],
+      ["EXPIRE", key, String(WINDOW_SECONDS), "NX"],
+    ]);
     const count = Number(results[0] ?? 0);
-
-    if (count === 1) {
-      await upstashPipeline(url, token, [
-        ["EXPIRE", key, String(WINDOW_SECONDS)],
-      ]);
-    }
 
     if (count > limit) {
       return { allowed: false };
