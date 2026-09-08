@@ -7,13 +7,18 @@ export const runtime = "nodejs";
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10MB
 const UPSTREAM_TIMEOUT_MS = 15000;
 
+// Default protocol version advertised per-request on the 2026-07-28
+// stateless transport. Clients send it via the MCP-Protocol-Version header
+// and via params._meta; the proxy fills it in when the client omits it.
+const MCP_PROTOCOL_VERSION = "2026-07-28";
+
 // MCP Streamable HTTP only needs these methods.
 const ALLOWED_METHODS = new Set(["GET", "POST", "DELETE"]);
 
 /**
  * Hop-by-hop and dangerous headers are never forwarded from the client body
- * to the upstream server. `mcp-session-id` is forwarded separately from the
- * incoming request headers to avoid spoofing/conflicts.
+ * to the upstream server. `mcp-session-id` is forwarded separately (request
+ * header wins, JSON-body header is the fallback) to avoid spoofing/conflicts.
  */
 const BLOCKED_HEADERS = new Set([
   // Hop-by-hop
@@ -38,6 +43,19 @@ function jsonError(message: string, status: number, extraHeaders?: Record<string
     status,
     headers: { "Content-Type": "application/json", ...extraHeaders },
   });
+}
+
+function getBodyHeaderCaseInsensitive(
+  headers: Record<string, unknown>,
+  name: string
+): string | undefined {
+  const lower = name.toLowerCase();
+  for (const [key, val] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower && typeof val === "string") {
+      return val;
+    }
+  }
+  return undefined;
 }
 
 export async function POST(req: NextRequest) {
@@ -85,18 +103,81 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Forward the MCP session id (stateful Streamable HTTP servers). The
-    // request header wins over anything supplied in the JSON body.
+    // Per-request protocol version (2026-07-28 stateless transport).
+    // Priority: incoming HTTP header > JSON-body header > server default.
+    // Always forwarded upstream so stateless servers can negotiate per-request.
+    const incomingProtocolVersion = req.headers.get("mcp-protocol-version");
+    const bodyProtocolVersion =
+      typeof headers === "object" && headers !== null
+        ? getBodyHeaderCaseInsensitive(
+            headers as Record<string, unknown>,
+            "mcp-protocol-version"
+          )
+        : undefined;
+    const protocolVersion =
+      incomingProtocolVersion && !/[\r\n]/.test(incomingProtocolVersion)
+        ? incomingProtocolVersion
+        : bodyProtocolVersion && !/[\r\n]/.test(bodyProtocolVersion)
+          ? bodyProtocolVersion
+          : MCP_PROTOCOL_VERSION;
+    safeHeaders["mcp-protocol-version"] = protocolVersion;
+
+    // Forward the MCP session id (legacy stateful servers only). The request
+    // HTTP header wins; the JSON-body header is accepted as a fallback
+    // because browser clients cannot always set custom HTTP headers through
+    // the proxy wrapper. Stateless 2026-07-28 servers simply ignore it.
     const incomingSessionId = req.headers.get("mcp-session-id");
-    if (incomingSessionId && !/[\r\n]/.test(incomingSessionId)) {
-      safeHeaders["mcp-session-id"] = incomingSessionId;
+    const bodySessionId =
+      typeof headers === "object" && headers !== null
+        ? getBodyHeaderCaseInsensitive(
+            headers as Record<string, unknown>,
+            "mcp-session-id"
+          )
+        : undefined;
+    const sessionId =
+      incomingSessionId && !/[\r\n]/.test(incomingSessionId)
+        ? incomingSessionId
+        : bodySessionId && !/[\r\n]/.test(bodySessionId)
+          ? bodySessionId
+          : undefined;
+    if (sessionId) {
+      safeHeaders["mcp-session-id"] = sessionId;
+    }
+
+    // Ensure per-request protocol metadata for stateless servers: when the
+    // JSON-RPC params lack `_meta.protocolVersion` (old clients), inject the
+    // negotiated version. `initialize` keeps its legacy top-level shape.
+    let upstreamBody: unknown = body ?? null;
+    if (
+      upstreamBody &&
+      typeof upstreamBody === "object" &&
+      (upstreamBody as { method?: unknown }).method !== "initialize" &&
+      (upstreamBody as { params?: unknown }).params &&
+      typeof (upstreamBody as { params: unknown }).params === "object"
+    ) {
+      const rpc = upstreamBody as {
+        params: Record<string, unknown>;
+      };
+      const meta =
+        rpc.params._meta && typeof rpc.params._meta === "object"
+          ? (rpc.params._meta as Record<string, unknown>)
+          : {};
+      if (meta.protocolVersion === undefined) {
+        upstreamBody = {
+          ...(upstreamBody as Record<string, unknown>),
+          params: {
+            ...rpc.params,
+            _meta: { ...meta, protocolVersion },
+          },
+        };
+      }
     }
 
     try {
       const response = await ssrfGuardedFetch(url, {
         method,
         headers: safeHeaders,
-        body: method !== "GET" && method !== "HEAD" ? JSON.stringify(body ?? null) : undefined,
+        body: method !== "GET" && method !== "HEAD" ? JSON.stringify(upstreamBody) : undefined,
         timeoutMs: UPSTREAM_TIMEOUT_MS,
         maxBytes: MAX_RESPONSE_BYTES,
       });
@@ -148,7 +229,8 @@ export async function POST(req: NextRequest) {
         "Content-Type": "application/json",
       };
 
-      // Pass the MCP session id back to the client so it can reuse it
+      // Pass the MCP session id back to the client so legacy stateful servers
+      // can be reused. Stateless servers omit it — that is expected, not an error.
       const upstreamSessionId = response.headers["mcp-session-id"];
       if (typeof upstreamSessionId === "string" && !/[\r\n]/.test(upstreamSessionId)) {
         responseHeaders["mcp-session-id"] = upstreamSessionId;
@@ -161,7 +243,10 @@ export async function POST(req: NextRequest) {
     } catch (err: unknown) {
       const error = err as { code?: string; message?: string };
       if (error.message === "Gateway timeout") {
-        return jsonError("Gateway Timeout", 504);
+        return jsonError(
+          `MCP upstream timed out after ${UPSTREAM_TIMEOUT_MS}ms`,
+          504
+        );
       }
       if (error.message === "Response payload too large") {
         return jsonError("Response payload too large", 413);

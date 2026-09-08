@@ -4,6 +4,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { Session, AppSettings, McpServer, McpServerConfig, ChatRequestBody, Message } from "@/lib/types";
 import { getSessions, getSettings, saveSettings, getMcpServers, saveMcpServer, deleteMcpServer } from "@/lib/db";
 import { initializeMcp, listMcpTools, clearMcpSession, McpTool } from "@/lib/mcp/client";
+import { cleanExpiredKeys, refreshKeyExpirations, KEY_FIELDS } from "@/lib/keyExpiry";
 
 const DEFAULT_SETTINGS: AppSettings = {
   id: "default",
@@ -18,9 +19,9 @@ const LEGACY_MODEL_DEFAULTS: Record<string, string> = {
   "gpt-4o-mini": "gpt-5.6-luna",
   "o1-preview": "gpt-5.6-luna",
   "o1-mini": "gpt-5.6-luna",
-  "claude-3-5-sonnet-latest": "claude-5-sonnet",
-  "claude-3-5-haiku-latest": "claude-5-sonnet",
-  "claude-3-opus-latest": "claude-5-sonnet",
+  "claude-3-5-sonnet-latest": "claude-sonnet-5",
+  "claude-3-5-haiku-latest": "claude-sonnet-5",
+  "claude-3-opus-latest": "claude-sonnet-5",
   "llama-3.3-70b-versatile": "qwen/qwen3.6-27b",
   "llama-3.1-70b-versatile": "qwen/qwen3.6-27b",
   "llama-3.1-8b-instant": "qwen/qwen3.6-27b",
@@ -148,13 +149,20 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       if (dbSettings) {
         // Upgrade stale default model IDs persisted by older versions.
         const migrated = migrateSettings(dbSettings);
-        setSettings(migrated);
-        loadedSettings = migrated;
-        if (migrated.defaultModel) {
-          setSelectedModel(migrated.defaultModel);
+        // Drop remembered keys whose 30-day expiry has passed (keys saved before
+        // this feature have no expiry entry and are left intact). Persist the
+        // cleanup so the deletion sticks.
+        const { settings: cleaned, dropped } = cleanExpiredKeys(migrated);
+        if (dropped.length > 0) {
+          await saveSettings(cleaned);
         }
-        if (migrated.theme) {
-          setThemeState(migrated.theme);
+        setSettings(cleaned);
+        loadedSettings = cleaned;
+        if (cleaned.defaultModel) {
+          setSelectedModel(cleaned.defaultModel);
+        }
+        if (cleaned.theme) {
+          setThemeState(cleaned.theme);
         }
       } else {
         // Default rememberKeys to true
@@ -169,7 +177,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       const dbServers = await getMcpServers();
       let loadedServers: McpServer[] = DEFAULT_MCP_SERVERS;
       if (dbServers.length > 0) {
-        loadedServers = dbServers.map(s => ({ ...s, status: "disconnected" as const }));
+        const withStatus: McpServer[] = dbServers.map(s => ({ ...s, status: "disconnected" as const }));
+        // Merge built-in presets missing from IndexedDB. Without this, adding
+        // any custom server (e.g. Tavily) persists only that server, and on the
+        // next reload the GitHub preset vanishes from the right panel.
+        const missingPresets = DEFAULT_MCP_SERVERS.filter(d => !withStatus.some(s => s.id === d.id));
+        for (const preset of missingPresets) {
+          const config: McpServerConfig = {
+            id: preset.id,
+            name: preset.name,
+            description: preset.description,
+            url: preset.url,
+            preset: preset.preset,
+            rememberAuth: preset.rememberAuth,
+            headers: preset.headers,
+          };
+          try {
+            await saveMcpServer(config);
+          } catch {
+            // Seeding is best-effort; in-memory merge below still restores UI.
+          }
+        }
+        loadedServers = [...missingPresets, ...withStatus];
         setMcpServers(loadedServers);
       }
 
@@ -238,17 +267,23 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     const updated = { ...settingsRef.current, ...newS };
     settingsRef.current = updated;
     setSettings(updated);
+
+    // Which remembered-secret fields does this update explicitly set?
+    const touchedFields = KEY_FIELDS.filter(f => f in newS);
+
     if (updated.rememberKeys) {
-      await saveSettings(updated);
+      // Stamp/refresh the 30-day expiry for any secret keys being (re)saved.
+      await saveSettings(refreshKeyExpirations(updated, touchedFields));
     } else {
-      // clear keys from storage, but keep system prompt
+      // clear keys from storage (and their expiries), but keep system prompt
       await saveSettings({
         ...updated,
         openAiKey: undefined,
         anthropicKey: undefined,
         groqKey: undefined,
         customKey: undefined,
-        githubPat: undefined
+        githubPat: undefined,
+        keyExpirations: undefined
       });
     }
   }, []);

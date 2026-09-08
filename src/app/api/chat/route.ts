@@ -6,6 +6,10 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOllama } from 'ollama-ai-provider';
 import { createGroq } from '@ai-sdk/groq';
 
+// Route segment config: allows longer function executions on Vercel/deployments
+// while extended reasoning ("thinking") is being generated (long latencies).
+export const maxDuration = 60;
+
 type JsonSchemaNode = {
   type?: string;
   properties?: Record<string, JsonSchemaNode>;
@@ -83,16 +87,21 @@ export async function POST(req: Request) {
     const customBaseUrl = req.headers.get('x-custom-base-url') || '';
 
     let languageModel: LanguageModel;
+    // The exact model id actually used after applying the provider default.
+    let resolvedModel = '';
 
     if (provider === 'openai') {
       const openai = createOpenAI({ apiKey: openaiKey });
-      languageModel = openai(model || 'gpt-5.6-luna');
+      resolvedModel = model || 'gpt-5.6-luna';
+      languageModel = openai(resolvedModel);
     } else if (provider === 'anthropic') {
       const anthropic = createAnthropic({ apiKey: anthropicKey });
-      languageModel = anthropic(model || 'claude-5-sonnet');
+      resolvedModel = model || 'claude-sonnet-5';
+      languageModel = anthropic(resolvedModel);
     } else if (provider === 'groq') {
       const groq = createGroq({ apiKey: groqKey });
-      languageModel = groq(model || 'qwen/qwen3.6-27b');
+      resolvedModel = model || 'qwen/qwen3.6-27b';
+      languageModel = groq(resolvedModel);
     } else if (provider === 'ollama') {
       const ollamaBase = ollamaUrl || 'http://127.0.0.1:11434/api';
 
@@ -112,16 +121,46 @@ export async function POST(req: Request) {
       }
 
       const ollama = createOllama({ baseURL: ollamaBase });
-      languageModel = ollama(model || 'llama3') as unknown as LanguageModel;
+      resolvedModel = model || 'llama3';
+      languageModel = ollama(resolvedModel) as unknown as LanguageModel;
     } else if (provider === 'custom') {
       const customProvider = createOpenAI({
         apiKey: customKey,
         baseURL: customBaseUrl,
       });
-      languageModel = customProvider(model || 'custom');
+      resolvedModel = model || 'custom';
+      languageModel = customProvider(resolvedModel);
     } else {
       return new Response(JSON.stringify({ error: `Provider ${provider} not supported` }), { status: 400 });
     }
+
+    // Provider-specific options that request extended reasoning ("thinking") on
+    // models that support it. Models that reject these options (the legacy
+    // claude-3 ids, non-reasoning openai/groq ids) are gated out so they don't
+    // error with a 400. Reasoning text returned by the SDK streams back over
+    // the wire as its own parts — it is never injected into the visible text.
+    let providerOptions: NonNullable<Parameters<typeof streamText>[0]['providerOptions']> | undefined;
+    if (provider === 'anthropic') {
+      // "adaptive" thinking (no budgetTokens) is the gen-5 path. The claude-3
+      // ids would reject these options, so only apply to anything that isn't
+      // a claude-3-* id.
+      if (!/^claude-3-?/.test(resolvedModel)) {
+        providerOptions = { anthropic: { thinking: { type: 'adaptive' }, effort: 'medium' } };
+      }
+    } else if (provider === 'openai') {
+      if (/(^|-)o1/.test(resolvedModel) || /gpt-5/i.test(resolvedModel)) {
+        providerOptions = { openai: { reasoningEffort: 'medium' } };
+      }
+    } else if (provider === 'groq') {
+      // Qwen3 thinking is opt-in, and reasoning text is only streamed back when
+      // reasoningFormat is "raw". Non-qwen groq models (llama/mixtral) would
+      // error on these, so gate on the model id containing "qwen".
+      if (resolvedModel.toLowerCase().includes('qwen')) {
+        providerOptions = { groq: { reasoningEffort: 'medium', reasoningFormat: 'raw' } };
+      }
+    }
+    // ollama / custom intentionally get no providerOptions: local models embed
+    // <think> tags in the text channel, and custom endpoints are unknown.
 
     // Convert UI messages to standard CoreMessage format for Vercel AI SDK
     const coreMessages: ModelMessage[] = [];
@@ -241,11 +280,13 @@ export async function POST(req: Request) {
       system: finalSystemPrompt,
       tools: hasTools ? tools : undefined,
       toolChoice: hasTools ? 'auto' : undefined,
-      onFinish({ toolCalls }) {
-        if (process.env.NODE_ENV === 'development') {
-          if (hasTools && (!toolCalls || toolCalls.length === 0)) {
-            console.log(`[Chat API] Model responded with 0 tool calls despite ${enabledTools.length} tools available.`);
-          }
+      ...(providerOptions ? { providerOptions } : {}),
+      onFinish({ toolCalls, finishReason, usage }) {
+        // Always log (not dev-only) so Vercel logs show why free-tier models
+        // like minimax-m3 skip tool calls instead of failing silently.
+        console.log(`[Chat API] finish model=${resolvedModel} reason=${finishReason} toolCalls=${toolCalls?.length ?? 0} toolsAvailable=${enabledTools?.length ?? 0} usage=${JSON.stringify(usage ?? {})}`);
+        if (hasTools && (!toolCalls || toolCalls.length === 0)) {
+          console.warn(`[Chat API] Model ${resolvedModel} responded with 0 tool calls despite ${enabledTools.length} tools available. Last user msg: ${(messages as unknown[] ?? []).length} msgs in history.`);
         }
       }
     });
@@ -253,6 +294,7 @@ export async function POST(req: Request) {
     return result.toUIMessageStreamResponse({
       onError: (error: unknown) => {
         // Never leak API keys/secrets; the AI SDK error objects here don't contain them.
+        console.error(`[Chat API] stream error model=${resolvedModel}:`, error instanceof Error ? error.message : String(error));
         const err = error as {
           statusCode?: number;
           message?: string;

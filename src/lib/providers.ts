@@ -15,7 +15,7 @@ export const PROVIDER_MODELS: Record<Provider, ModelInfo[]> = {
     { id: "o1-mini", name: "o1 Mini", provider: "openai" },
   ],
   anthropic: [
-    { id: "claude-5-sonnet", name: "Claude 5 Sonnet", provider: "anthropic" },
+    { id: "claude-sonnet-5", name: "Claude 5 Sonnet", provider: "anthropic" },
     { id: "claude-3-5-sonnet-latest", name: "Claude 3.5 Sonnet", provider: "anthropic" },
     { id: "claude-3-5-haiku-latest", name: "Claude 3.5 Haiku", provider: "anthropic" },
     { id: "claude-3-opus-latest", name: "Claude 3 Opus", provider: "anthropic" },

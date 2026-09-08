@@ -10,48 +10,54 @@ A developer-first, local-first LLM playground that integrates the Model Context 
 
 ## 🚀 Key Features
 
-*   **Zero-Backend-Cost (BYOK):** Bring your own LLM keys (OpenAI, Anthropic, Groq, Ollama) or any **Custom Provider** (OpenAI API-compatible endpoints like vLLM, LM Studio, or OpenRouter) and GitHub Personal Access Tokens (PAT).
-*   **Human-in-the-loop (HITL):** All MCP tool calls require manual user approval before execution, ensuring full control over what actions the LLM takes on your behalf.
-*   **GitHub Write Mode:** Toggle write actions (create/update/delete) for the GitHub MCP to save prompt tokens and fit within lower-tier model limits.
-*   **Dynamic Provider & Model Selection:** Define custom model strings for any popular provider, or add entirely custom Base URLs directly in the settings. The UI dynamically detects your configured keys and offers them as selectable models without manual toggling.
-*   **Local-First / Private:** All keys, prompt templates, and chat histories are stored inside your browser's **IndexedDB**. Keys are held in memory and forwarded per-request to the model provider — they are never persisted server-side.
-*   **Real-time Streaming & Metrics:** Smooth stream processing for all providers. Track estimated token usage (including MCP schema overhead) and API latency in real-time.
-*   **Hosted MCP Presets (GitHub):** Wire up the official hosted GitHub copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`) natively using your GitHub PAT.
-*   **Custom remote MCPs:** Proxy JSON-RPC requests safely using an SSRF-shielded HTTP proxy.
-*   **Developer Diagnostics:** Inspect exact raw payload requests and stream responses. Export fully-typed TypeScript (Vercel AI SDK) and curl commands instantly.
+- **Zero-Backend-Cost (BYOK):** Bring your own LLM keys (OpenAI, Anthropic, Groq, Ollama) or any **Custom Provider** (OpenAI API-compatible endpoints like vLLM, LM Studio, or OpenRouter) and GitHub Personal Access Tokens (PAT).
+- **Human-in-the-loop (HITL):** All MCP tool calls require manual user approval before execution, ensuring full control over what actions the LLM takes on your behalf.
+- **GitHub Write Mode:** Toggle write actions (create/update/delete) for the GitHub MCP to save prompt tokens and fit within lower-tier model limits.
+- **Dynamic Provider & Model Selection:** Define custom model strings for any popular provider, or add entirely custom Base URLs directly in the settings. The UI dynamically detects your configured keys and offers them as selectable models without manual toggling.
+- **Local-First / Private:** All keys, prompt templates, and chat histories are stored inside your browser's **IndexedDB**. Keys are held in memory and forwarded per-request to the model provider — they are never persisted server-side.
+- **Automatic Key Expiry:** Remembered API keys auto-expire after 30 days without being refreshed, so a forgotten browser profile doesn't keep your secrets indefinitely.
+- **Real-time Streaming & Metrics:** Smooth stream processing for all providers. Track estimated token usage (including MCP schema overhead) and API latency in real-time.
+- **Hosted MCP Presets (GitHub):** Wire up the official hosted GitHub copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`) natively using your GitHub PAT.
+- **Custom remote MCPs:** Proxy JSON-RPC requests safely using an SSRF-shielded HTTP proxy.
+- **Developer Diagnostics:** Inspect exact raw payload requests and stream responses. Export fully-typed TypeScript (Vercel AI SDK) and curl commands instantly.
 
 ---
 
 ## 🛠️ Setup Instructions
 
 ### 1. Run the App Locally
+
 ```bash
 npm install
 cp .env.example .env.local   # optional: configure environment variables (see below)
 npm run dev
 ```
+
 Open [http://localhost:3000](http://localhost:3000) to view the workspace.
 
 ### 2. Enter API Keys (BYOK)
+
 1. Click **Settings** in the bottom-left corner.
 2. Configure a **Custom Provider** (Base URL, API Key, Model ID) for any OpenAI-compatible API, or expand **Popular Providers** to set keys and override default model IDs for:
-    *   **OpenAI** (`sk-...`)
-    *   **Anthropic** (`sk-ant-...`)
-    *   **Groq** (`gsk_...`)
-    *   **Ollama** (defaults to local `http://127.0.0.1:11434/api`)
+   - **OpenAI** (`sk-...`)
+   - **Anthropic** (`sk-ant-...`)
+   - **Groq** (`gsk_...`)
+   - **Ollama** (defaults to local `http://127.0.0.1:11434/api`)
 3. Optional: Enable **Remember keys on this device** to persist keys inside your IndexedDB.
 
 ### 3. Connect GitHub MCP
+
 1. Switch to the **MCP Servers** tab on the right sidebar.
 2. In the **GitHub Integration** preset card:
-    *   Generate a read-only fine-grained GitHub PAT by clicking the provided link out to [GitHub Settings](https://github.com/settings/personal-access-tokens/new).
-    *   To safely limit blast radius, grant only **Contents (read)** and **Metadata (read)** scopes. For write actions, grant **Contents (write)**, **Issues (write)**, and **Pull Requests (write)**.
-    *   Paste your PAT into the token field.
+   - Generate a read-only fine-grained GitHub PAT by clicking the provided link out to [GitHub Settings](https://github.com/settings/personal-access-tokens/new).
+   - To safely limit blast radius, grant only **Contents (read)** and **Metadata (read)** scopes. For write actions, grant **Contents (write)**, **Issues (write)**, and **Pull Requests (write)**.
+   - Paste your PAT into the token field.
 3. Click **Connect**.
 4. Once connected, all available GitHub tools (like `get_me`, `get_file_contents`, etc.) will load instantly!
 5. Optional: Toggle **GitHub Write Mode** in the server settings to filter out non-read tools, keeping your prompt context small and avoiding rate limits on smaller models.
 
 ### 4. Bring Your Own MCP (Custom Remote Servers)
+
 Connect **any** remote MCP server — not just the built-in GitHub preset — by
 adding it directly in the right sidebar.
 
@@ -79,6 +85,7 @@ adding it directly in the right sidebar.
 > before approving, and only connect servers you trust.
 
 ### 5. Interactive Chat & Safety
+
 1. Start a new chat session.
 2. When the LLM decides to use a tool, it will enter a **"Needs Approval"** state.
 3. Review the tool arguments and click **Confirm & Run** to execute the tool or **Deny** to cancel.
@@ -86,17 +93,61 @@ adding it directly in the right sidebar.
 
 ---
 
+## 🧠 Reasoning Accordion
+
+When a model "thinks" before answering, that hidden reasoning is surfaced in the
+**Thought process** accordion above each assistant reply. It is collapsed by
+default and shows a live _"Thinking…"_ placeholder while it is still streaming.
+
+The accordion is fed from two sources:
+
+1. **Reasoning blocks embedded in the text** of local / OpenAI-compatible models
+   (e.g. Ollama). Tags such as `<think>`, `<thinking>`, `<reasoning>`, and
+   `<thought>` are parsed client-side, stripped from the visible answer, and
+   shown under the accordion instead — with a fallback if a tag opens but never
+   closes.
+2. **Dedicated reasoning stream deltas** from hosted reasoning models — Claude
+   adaptive thinking, OpenAI reasoning models, and Groq's Qwen3 thinking. These
+   deltas are rendered only inside the accordion and never appear in the main
+   answer body.
+
+Reasoning content never bleeds into the main reply — the visible answer always
+stays clean.
+
+---
+
+## 🎯 Skills
+
+Skills are reusable instruction presets / prompt templates shown in the left
+sidebar with an icon. Four built-in skills are seeded on first run:
+
+| Skill         | Icon        |
+| ------------- | ----------- |
+| Repo Explorer | folder-tree |
+| Code Reviewer | code        |
+| Debugger      | bug         |
+| Data Analyst  | database    |
+
+Clicking a skill opens an editable instruction preview and a **"use GitHub MCP"**
+toggle. **Apply** places the instructions into the input box for your next
+message. You can create custom skills (choose a name, an icon including
+sparkles, instructions, and an optional GitHub MCP toggle) and delete custom
+ones. Everything is stored locally in IndexedDB via `getSkills` / `saveSkill` /
+`deleteSkill`.
+
+---
+
 ## ⚙️ Environment Variables
 
 All environment variables are **optional** — the app works out of the box with an empty `.env.local`. See [`.env.example`](.env.example) for placeholders.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `ALLOW_PRIVATE_MCP` | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy (and to allow a local Ollama URL on hosted deployments). **Never enable this on a publicly deployed instance** (e.g. Vercel). |
-| `UPSTASH_REDIS_REST_URL` | _(empty)_ | Upstash Redis REST endpoint. If both Upstash variables are empty, rate limiting is fully disabled. Create a free database at [upstash.com](https://upstash.com) → Redis → REST API details. |
-| `UPSTASH_REDIS_REST_TOKEN` | _(empty)_ | Upstash Redis REST token (kept server-side only). |
-| `RATE_LIMIT_CHAT_PER_MINUTE` | `20` | Chat requests per minute per IP. |
-| `RATE_LIMIT_MCP_PER_MINUTE` | `60` | MCP proxy requests per minute per IP. |
+| Variable                     | Default   | Description                                                                                                                                                                                                                                                       |
+| ---------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLOW_PRIVATE_MCP`          | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy (and to allow a local Ollama URL on hosted deployments). **Never enable this on a publicly deployed instance** (e.g. Vercel). |
+| `UPSTASH_REDIS_REST_URL`     | _(empty)_ | Upstash Redis REST endpoint. If both Upstash variables are empty, rate limiting is fully disabled. Create a free database at [upstash.com](https://upstash.com) → Redis → REST API details.                                                                       |
+| `UPSTASH_REDIS_REST_TOKEN`   | _(empty)_ | Upstash Redis REST token (kept server-side only).                                                                                                                                                                                                                 |
+| `RATE_LIMIT_CHAT_PER_MINUTE` | `20`      | Chat requests per minute per IP.                                                                                                                                                                                                                                  |
+| `RATE_LIMIT_MCP_PER_MINUTE`  | `60`      | MCP proxy requests per minute per IP.                                                                                                                                                                                                                             |
 
 > **Rate limiting** activates automatically as soon as both Upstash variables are set — no code changes needed. It is implemented against the Upstash REST API with zero extra npm dependencies and **fails open** if Redis is unreachable. Clients are identified by the `x-forwarded-for` / `x-real-ip` headers — make sure your reverse proxy (nginx, Caddy, …) **overwrites** these headers for untrusted requests, otherwise clients can spoof their rate-limit identity. For public deployments (e.g. Vercel), enabling it is recommended.
 

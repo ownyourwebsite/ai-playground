@@ -110,6 +110,8 @@ export type AppSettings = {
   customModel?: string;
   savedProviders?: SavedProvider[];
   githubPat?: string;
+  /** Epoch-ms expiry timestamps per remembered secret key field (see keyExpiry.ts). */
+  keyExpirations?: Record<string, number>;
   systemPrompt: string;
   rememberKeys: boolean;
   defaultModel?: string;

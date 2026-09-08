@@ -113,7 +113,7 @@ function WorkspaceContent() {
       case "openai":
         return { provider: "openai", model: currentSettings.openAiModel || "gpt-5.6-luna" };
       case "anthropic":
-        return { provider: "anthropic", model: currentSettings.anthropicModel || "claude-5-sonnet" };
+        return { provider: "anthropic", model: currentSettings.anthropicModel || "claude-sonnet-5" };
       case "groq":
         return { provider: "groq", model: currentSettings.groqModel || "qwen/qwen3.6-27b" };
       case "ollama":
@@ -139,7 +139,7 @@ function WorkspaceContent() {
       options.push({ value: "openai", label: `OpenAI (${settings.openAiModel || "gpt-5.6-luna"})` });
     }
     if (settings.anthropicKey) {
-      options.push({ value: "anthropic", label: `Anthropic (${settings.anthropicModel || "claude-5-sonnet"})` });
+      options.push({ value: "anthropic", label: `Anthropic (${settings.anthropicModel || "claude-sonnet-5"})` });
     }
     if (settings.groqKey) {
       options.push({ value: "groq", label: `Groq (${settings.groqModel || "qwen/qwen3.6-27b"})` });
@@ -183,13 +183,17 @@ function WorkspaceContent() {
       if (activeSessionId) {
         const session = await getSession(activeSessionId);
         if (session) {
-          // Migrate/prune old malformed or incomplete tool invocations
+          // Drop only truly malformed invocations (missing ids). Pending
+          // cards (calling / needs-approval / executing) must survive a
+          // reload — otherwise the approval card flashes and vanishes into
+          // "No MCP tool was called" right after the first persist creates
+          // the session id and triggers this reload.
           const prunedMessages = session.messages.map((m: Message) => {
             if (m.role === "assistant" && m.toolInvocations) {
               return {
                 ...m,
                 toolInvocations: m.toolInvocations.filter((ti: ToolInvocation) =>
-                  ti.state === "result" || (ti.result !== undefined && ti.result !== null)
+                  Boolean(ti.toolCallId) && Boolean(ti.toolName)
                 )
               };
             }
@@ -457,11 +461,28 @@ function WorkspaceContent() {
       const decoder = new TextDecoder();
       let buffer = "";
       let assistantContent = "";
+      let assistantReasoning = "";
+      let reasoningDeltaOpen = false;
       const toolInvocations: ToolInvocation[] = [];
       let streamError = "";
 
       // Create initial empty assistant message
       setMessages((prev: Message[]) => [...prev, { id: assistantMessageId, role: "assistant", content: "", toolInvocations: [] }]);
+
+      // Merge tag-based reasoning (parsed out of the visible text, e.g. Ollama
+      // <think> blocks) with dedicated reasoning stream deltas (hosted reasoning
+      // models) so the accordion shows the complete thought process. Reasoning is
+      // never appended to the visible answer content.
+      const updateAssistant = () => {
+        const parsed = parseReasoning(assistantContent);
+        const reasoning = [parsed.reasoning, assistantReasoning].filter(Boolean).join("\n\n") || null;
+        const reasoningOpen = parsed.isOpen || reasoningDeltaOpen;
+        setMessages((prev: Message[]) =>
+          prev.map((m: Message) =>
+            m.id === assistantMessageId ? { ...m, content: parsed.cleanText, reasoning, reasoningOpen, statusLine: undefined } : m
+          )
+        );
+      };
 
       const processLine = (line: string) => {
         if (!line.trim()) return;
@@ -480,6 +501,7 @@ function WorkspaceContent() {
         try {
           if (type === "3") {
             streamError = payloadStr.replace(/^"|"$/g, '') || "Request failed";
+            console.error("[Chat] stream error:", streamError);
             setMessages((prev: Message[]) =>
               prev.map((m: Message) =>
                 m.id === assistantMessageId ? { ...m, error: streamError } : m
@@ -492,12 +514,7 @@ function WorkspaceContent() {
 
           if (type === "0") {
             assistantContent += payload;
-            const parsed = parseReasoning(assistantContent);
-            setMessages((prev: Message[]) =>
-              prev.map((m: Message) =>
-                m.id === assistantMessageId ? { ...m, content: parsed.cleanText, reasoning: parsed.reasoning, reasoningOpen: parsed.isOpen, statusLine: undefined } : m
-              )
-            );
+            updateAssistant();
           } else if (type === "9") {
             const toolCall: ToolInvocation = {
               toolCallId: payload.toolCallId,
@@ -515,14 +532,23 @@ function WorkspaceContent() {
           } else if (type === "data") {
             if (payload.type === "text-delta") {
               assistantContent += payload.delta || "";
-              const parsed = parseReasoning(assistantContent);
-              setMessages((prev: Message[]) =>
-                prev.map((m: Message) =>
-                  m.id === assistantMessageId ? { ...m, content: parsed.cleanText, reasoning: parsed.reasoning, reasoningOpen: parsed.isOpen, statusLine: undefined } : m
-                )
-              );
+              updateAssistant();
+            } else if (payload.type === "reasoning-start") {
+              reasoningDeltaOpen = true;
+              // Reasoning is streaming before any visible text — surface the
+              // accordion with a live "Thinking…" placeholder via reasoningOpen.
+              updateAssistant();
+            } else if (payload.type === "reasoning-delta") {
+              // Reasoning deltas are appended ONLY to assistantReasoning, never to
+              // assistantContent, so thinking can't leak into the visible answer.
+              assistantReasoning += payload.delta || "";
+              updateAssistant();
+            } else if (payload.type === "reasoning-end") {
+              reasoningDeltaOpen = false;
+              updateAssistant();
             } else if (payload.type === "error") {
               streamError = payload.errorText || "An error occurred";
+              console.error("[Chat] stream error (data channel):", streamError, payload);
               setMessages((prev: Message[]) =>
                 prev.map((m: Message) =>
                   m.id === assistantMessageId ? { ...m, error: streamError } : m
@@ -595,11 +621,12 @@ function WorkspaceContent() {
       // markup — surface the whole reply as the answer instead of hiding it
       // behind the "Thought process" accordion.
       const reasoningUnclosed = parsedFinal.isOpen;
+      const reasoningText = [parsedFinal.reasoning, assistantReasoning].filter(Boolean).join("\n\n") || null;
       const finalAssistant: Message = {
         id: assistantMessageId,
         role: "assistant",
         content: reasoningUnclosed ? stripOpenReasoningTag(assistantContent) : parsedFinal.cleanText,
-        reasoning: reasoningUnclosed ? null : parsedFinal.reasoning,
+        reasoning: reasoningUnclosed ? null : reasoningText,
         reasoningOpen: false,
         toolInvocations,
         ...(streamError ? { error: streamError } : {}),
@@ -657,17 +684,34 @@ function WorkspaceContent() {
         ...call,
         args: resolvedArgs,
         validation,
+        serverId: call.serverId ?? toolDef?.serverId,
+        originalName: call.originalName ?? toolDef?.originalName,
         state: validation.valid ? 'needs-approval' as const : 'result' as const,
         result: validation.valid ? undefined : { error: `Missing required parameter(s): ${validation.missingFields.join(', ')}` },
         turnCount
       };
     });
 
-    setMessages((prev: Message[]) =>
-      prev.map((m: Message) =>
+    setMessages((prev: Message[]) => {
+      const next = prev.map((m: Message) =>
         m.id === assistantMessageId ? { ...m, toolInvocations: resolvedInvocations, statusLine: undefined } : m
-      )
-    );
+      );
+      // Persist pending approval cards too — otherwise the first-message
+      // reload (persist -> setActiveSessionId -> loadActiveSession) wipes
+      // them and the UI flips to "No MCP tool was called".
+      persistSession(next);
+      return next;
+    });
+    // Log validation failures loudly: free-tier models (e.g. minimax-m3 via
+    // OpenRouter) often emit tool calls with missing args, which previously
+    // looked like "the card just disappeared".
+    resolvedInvocations.forEach((ti) => {
+      if (ti.state === 'result' && (ti.result as { error?: string } | undefined)?.error) {
+        console.error(`[MCP] tool "${ti.toolName}" rejected before execution:`, (ti.result as { error?: string }).error, { args: ti.args });
+      } else if (ti.state === 'needs-approval') {
+        console.log(`[MCP] tool "${ti.toolName}" awaiting approval`, { args: ti.args });
+      }
+    });
     setIsLoading(false);
   };
 
@@ -737,20 +781,37 @@ function WorkspaceContent() {
         return newMessages;
       });
     } catch (err: unknown) {
-      const error = err as { message?: string };
-      setMessages((prev: Message[]) =>
-        prev.map((m: Message) => {
+      const rawMessage =
+        err instanceof Error && err.message
+          ? err.message
+          : typeof err === "string" && err
+            ? err
+            : "Unknown error";
+      // Never leave the confirmation card in a silent/broken state: always
+      // surface an explicit error result so the user sees what happened.
+      // console.error keeps it visible in Vercel logs too (previously zero logs).
+      console.error(`[MCP] executeToolCall failed for "${toolCall.toolName}":`, rawMessage, { args });
+      const displayMessage = rawMessage.startsWith("MCP tool call failed")
+        ? rawMessage
+        : `MCP tool call failed: ${rawMessage}`;
+      setMessages((prev: Message[]) => {
+        const next = prev.map((m: Message) => {
           if (m.id === assistantMessageId) {
             return {
               ...m,
+              statusLine: undefined,
               toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) =>
-                ti.toolCallId === toolCallId ? { ...ti, state: 'result' as const, result: { error: error.message } } : ti
+                ti.toolCallId === toolCallId
+                  ? { ...ti, state: 'result' as const, result: { error: displayMessage } }
+                  : ti
               )
             };
           }
           return m;
-        })
-      );
+        });
+        persistSession(next);
+        return next;
+      });
     }
   };
 
@@ -899,7 +960,7 @@ function WorkspaceContent() {
                   className={`max-w-[85%] sm:max-w-[80%] rounded-2xl px-5 py-3.5 text-[15px] leading-relaxed shadow-sm overflow-hidden ${msg.role === "user"
                     ? "bg-primary text-primary-foreground rounded-tr-sm selection:bg-primary-foreground/30"
                     : "bg-muted/40 text-foreground rounded-tl-sm border border-border/50"
-                    }`}
+                    }${(msg.toolInvocations?.length ?? 0) > 0 ? " w-full" : ""}`}
                 >
                   {(() => {
                     // Prefer the stored reasoning (set during streaming); fall
@@ -1010,7 +1071,7 @@ function WorkspaceContent() {
         </div>
 
         {/* Input Form */}
-        <div className="p-4 bg-gradient-to-t from-background via-background to-transparent pb-4 md:pb-6">
+        <div className="p-4 bg-gradient-to-t from-background via-background to-transparent pb-1.5 md:pb-2">
           <form onSubmit={handleFormSubmit} className="max-w-3xl mx-auto w-full relative">
             <div className="flex items-center gap-2 mb-2 px-1">
               {messages.length > 1 && !isLoading && (
@@ -1079,10 +1140,31 @@ function WorkspaceContent() {
                 </div>
               );
             })()}
-            <div className="text-center mt-2 text-xs text-muted-foreground font-medium hidden sm:block leading-tight">
+            <div className="text-center mt-1.5 mb-0.5 text-xs text-muted-foreground font-medium hidden sm:block leading-tight">
               AI models can make mistakes. Verify important information.
               <br />
-              <span className="font-semibold text-foreground/60">Built by Own Your Website</span>
+              <span className="inline-flex items-center justify-center gap-1.5">
+                <a
+                  href="https://github.com/ownyourwebsite/ai-playground"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-semibold text-foreground/60 hover:text-primary transition-colors"
+                >
+                  Built by Own Your Website
+                </a>
+                <a
+                  href="https://github.com/ownyourwebsite/ai-playground"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="GitHub repository"
+                  title="Open source on GitHub"
+                  className="text-foreground/50 hover:text-primary transition-colors"
+                >
+                  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" className="w-3.5 h-3.5">
+                    <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+                  </svg>
+                </a>
+              </span>
             </div>
           </form>
         </div>
@@ -1167,10 +1249,71 @@ type ToolCallCardProps = {
   setMessages: (messages: Message[] | ((prev: Message[]) => Message[])) => void;
 };
 
+function truncateToolTarget(value: string, max = 60): string {
+  const clean = value.trim();
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, max - 1).trimEnd()}…`;
+}
+
+function getToolTargetLabel(toolName: string, args: Record<string, unknown> | undefined): string | null {
+  if (!args || typeof args !== "object") return null;
+  const asStr = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() ? v.trim() : null;
+  // 1. Direct file keys — this is what makes GitHub show ".gitignore".
+  for (const key of ["path", "file_path", "file", "filename", "filepath", "filePath"]) {
+    const hit = asStr((args as Record<string, unknown>)[key]);
+    if (hit) return truncateToolTarget(hit, 60);
+  }
+  // 2. push_files-style batch: files: [{ path, ... }]
+  const files = (args as Record<string, unknown>).files;
+  if (Array.isArray(files) && files.length > 0) {
+    const firstPath = asStr((files[0] as Record<string, unknown>)?.path);
+    if (firstPath) {
+      return files.length > 1
+        ? `${truncateToolTarget(firstPath, 48)} +${files.length - 1} more`
+        : truncateToolTarget(firstPath, 60);
+    }
+  }
+  // 3. owner/repo fallback (e.g. list_issues without a path).
+  const owner = asStr((args as Record<string, unknown>).owner);
+  const repo = asStr((args as Record<string, unknown>).repo);
+  if (owner && repo) return truncateToolTarget(`${owner}/${repo}`, 60);
+  // 4. Search-like tools (Tavily): show the query, not an empty slot.
+  for (const key of ["query", "q", "question", "url", "title"]) {
+    const hit = asStr((args as Record<string, unknown>)[key]);
+    if (hit) return truncateToolTarget(hit, 60);
+  }
+  void toolName;
+  return null;
+}
+
+function getServerShortLabel(server: McpServer | undefined, toolName: string): string | null {
+  if (server) {
+    if (server.id === "github" || server.preset === "github") return "GitHub MCP";
+    const name = (server.name || "").trim();
+    if (!name) return null;
+    if (/mcp/i.test(name)) return name;
+    // "Tavily Search" -> "Tavily", "GitHub Integration" -> "GitHub".
+    const first = name.split(/\s+/)[0];
+    return first.length >= 2 ? first : name;
+  }
+  const lower = toolName.toLowerCase();
+  if (lower.startsWith("github_")) return "GitHub MCP";
+  if (lower.startsWith("tavily_")) return "Tavily";
+  return null;
+}
+
 function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMessages }: ToolCallCardProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [manuallyExpanded, setManuallyExpanded] = useState(false);
+  const { mcpServers } = useWorkspace();
 
   const isResult = toolCall.state === 'result';
+  const cardResult = toolCall.result as { error?: string } | undefined;
+  const cardHasError = isResult && !!cardResult?.error;
+  // Errors auto-expand without setState-in-effect: derived, not synchronized.
+  // Default is collapsed — user opens Details on demand.
+  const expanded = manuallyExpanded || cardHasError;
+  const setExpanded = setManuallyExpanded;
   const isExecuting = toolCall.state === 'executing';
   const needsApproval = toolCall.state === 'needs-approval';
   const isQueued = needsApproval && !isFirstPending;
@@ -1188,28 +1331,55 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMes
   else if (isResult && result?.error === 'User declined tool execution.') { statusText = 'Declined'; statusColor = 'text-muted-foreground'; }
   else if (isResult) { statusText = 'Success'; statusColor = 'text-emerald-500'; }
 
+  // Server attribution: direct id first, then match by known tool names
+  // (covers cards created before serverId was persisted), then prefix guess.
+  const owningServer: McpServer | undefined =
+    mcpServers.find((s: McpServer) => s.id === toolCall.serverId) ??
+    mcpServers.find((s: McpServer) =>
+      (s.tools ?? []).some((t: McpTool) =>
+        t.name === toolCall.toolName ||
+        t.originalName === toolCall.toolName ||
+        toolCall.toolName.endsWith(`_${t.name}`)
+      )
+    );
+  const serverLabel = getServerShortLabel(owningServer, toolCall.toolName);
+  const targetLabel = getToolTargetLabel(
+    toolCall.originalName || toolCall.toolName,
+    toolCall.args as Record<string, unknown> | undefined
+  );
+  const headerTitle = [serverLabel, toolCall.toolName, targetLabel].filter(Boolean).join(" • ");
+
   return (
     <div
       data-state={toolCall.state}
       className={`w-full mt-2 text-xs border rounded-xl transition-all ${isActiveApproval ? 'border-primary ring-1 ring-primary/20 bg-primary/5 animate-pulse' : 'border-border/60 bg-muted/30'}`}
     >
-      {/* Collapsed Header */}
+      {/* Collapsed Header: wrench • Server • tool • target ..... status • [Details] */}
       <div
-        className="flex items-center justify-between p-2.5 cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition-colors rounded-xl"
+        className="flex items-center gap-2 p-2.5 cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition-colors rounded-xl"
         onClick={() => setExpanded(!expanded)}
       >
-        <div className="flex items-center gap-2 overflow-hidden">
+        <div className="flex items-center gap-2 overflow-hidden flex-1 min-w-0">
           <div className="w-5 h-5 rounded flex items-center justify-center bg-background border border-border/50 shrink-0">
             <Wrench className="w-3 h-3 text-muted-foreground" />
           </div>
-          <span className="font-semibold text-foreground truncate text-[11px]">{toolCall.toolName}</span>
+          <span className="font-semibold text-foreground truncate text-[11px]" title={headerTitle}>{headerTitle}</span>
         </div>
 
-        <div className="flex items-center gap-3 shrink-0 ml-2">
-          <span className={`text-[10px] font-medium ${statusColor}`}>
+        <div className="flex items-center gap-2 shrink-0 ml-2">
+          <span className={`text-[10px] font-medium whitespace-nowrap ${statusColor}`}>
             {statusText}
           </span>
-          <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          <span className="text-muted-foreground/40 select-none">•</span>
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+            className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border/60 bg-background text-[10px] font-medium text-muted-foreground hover:bg-muted transition-colors cursor-pointer whitespace-nowrap"
+          >
+            {expanded ? "Hide" : "Details"}
+            <ChevronDown className={`w-3 h-3 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          </button>
         </div>
       </div>
 
@@ -1234,12 +1404,12 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMes
         </div>
       )}
 
-      {/* Action Buttons for Active Approval */}
+      {/* Action Buttons for Active Approval: 75% Confirm (black) / 25% Deny (1px light border) */}
       {isActiveApproval && (
-        <div className="flex gap-2 p-2 pt-0 border-t border-border/20 mt-1">
+        <div className="flex gap-2 px-2.5 pb-2.5 pt-2 border-t border-border/20 mt-1">
           <button
             onClick={(e) => { e.stopPropagation(); executeToolCall(msgId, toolCall.toolCallId); }}
-            className="flex-1 bg-primary text-primary-foreground font-bold py-1.5 rounded-lg hover:bg-primary/90 transition-colors cursor-pointer text-[10px]"
+            className="flex-[3] bg-primary text-primary-foreground font-bold py-1.5 rounded-lg hover:bg-primary/90 transition-colors cursor-pointer text-[11px]"
           >
             Confirm & Run
           </button>
@@ -1253,7 +1423,7 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMes
                 } : ti)
               } : m));
             }}
-            className="px-3 border border-border bg-background hover:bg-muted text-foreground font-bold py-1.5 rounded-lg transition-colors cursor-pointer text-[10px]"
+            className="flex-[1] border border-border/60 bg-background hover:bg-muted text-foreground font-bold py-1.5 rounded-lg transition-colors cursor-pointer text-[11px]"
           >
             Deny
           </button>

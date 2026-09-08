@@ -28,7 +28,7 @@ function SettingsForm() {
   const [openAiKey, setOpenAiKey] = useState(settings.openAiKey || "");
   const [openAiModel, setOpenAiModel] = useState(settings.openAiModel || "gpt-5.6-luna");
   const [anthropicKey, setAnthropicKey] = useState(settings.anthropicKey || "");
-  const [anthropicModel, setAnthropicModel] = useState(settings.anthropicModel || "claude-5-sonnet");
+  const [anthropicModel, setAnthropicModel] = useState(settings.anthropicModel || "claude-sonnet-5");
   const [groqKey, setGroqKey] = useState(settings.groqKey || "");
   const [groqModel, setGroqModel] = useState(settings.groqModel || "qwen/qwen3.6-27b");
   const [ollamaUrl, setOllamaUrl] = useState(settings.ollamaUrl || "http://127.0.0.1:11434/api");
@@ -329,7 +329,7 @@ function SettingsForm() {
                         type="text"
                         value={anthropicModel}
                         onChange={(e) => setAnthropicModel(e.target.value)}
-                        placeholder="claude-5-sonnet"
+                        placeholder="claude-sonnet-5"
                         className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                       />
                     </div>
@@ -430,6 +430,9 @@ function SettingsForm() {
           </div>
           <div className="text-[10px] text-amber-600 dark:text-amber-500 font-medium italic leading-snug">
             ⚠️ Warning: Enabling this persists your keys in your local browser database. They are never sent to our servers.
+          </div>
+          <div className="text-[10px] text-muted-foreground italic leading-snug">
+            🕒 Remembered keys are automatically cleared after 30 days without being refreshed.
           </div>
 
           <div className="h-[1px] w-full bg-border my-3" />
