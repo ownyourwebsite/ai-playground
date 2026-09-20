@@ -815,6 +815,45 @@ function WorkspaceContent() {
     }
   };
 
+  const declineToolCall = (assistantMessageId: string, toolCallId: string) => {
+    setMessages((prev: Message[]) => {
+      const currentToolCall = prev
+        .find((m: Message) => m.id === assistantMessageId)
+        ?.toolInvocations?.find((ti: ToolInvocation) => ti.toolCallId === toolCallId);
+
+      // Ignore stale/double clicks. In particular, never overwrite a result
+      // that arrived while the approval card was still visible.
+      if (!currentToolCall || currentToolCall.state !== 'needs-approval') return prev;
+
+      const next = prev.map((m: Message) => m.id === assistantMessageId ? {
+        ...m,
+        statusLine: undefined,
+        toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) =>
+          ti.toolCallId === toolCallId
+            ? { ...ti, state: 'result' as const, result: { error: 'User declined tool execution.' } }
+            : ti
+        )
+      } : m);
+
+      persistSession(next);
+
+      // A denial is a valid tool result. Once every parallel call has either
+      // completed or been denied, continue the model turn so the LLM can
+      // explain the cancellation or choose a different approach.
+      const updatedMessage = next.find((m: Message) => m.id === assistantMessageId);
+      const allResolved = updatedMessage?.toolInvocations?.every(
+        (ti: ToolInvocation) => ti.state === 'result'
+      ) ?? false;
+      if (allResolved) {
+        setTimeout(() => {
+          sendMessage(null, next, (currentToolCall.turnCount || 0) + 1);
+        }, 0);
+      }
+
+      return next;
+    });
+  };
+
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
@@ -1028,6 +1067,7 @@ function WorkspaceContent() {
                         msgId={msg.id}
                         isFirstPending={toolCall.toolCallId === firstPendingToolId}
                         executeToolCall={executeToolCall}
+                        declineToolCall={declineToolCall}
                         setMessages={setMessages}
                       />
                     ));
@@ -1246,6 +1286,7 @@ type ToolCallCardProps = {
   msgId: string;
   isFirstPending: boolean;
   executeToolCall: (assistantMessageId: string, toolCallId: string, updatedArgs?: Record<string, unknown>) => void;
+  declineToolCall: (assistantMessageId: string, toolCallId: string) => void;
   setMessages: (messages: Message[] | ((prev: Message[]) => Message[])) => void;
 };
 
@@ -1303,7 +1344,7 @@ function getServerShortLabel(server: McpServer | undefined, toolName: string): s
   return null;
 }
 
-function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMessages }: ToolCallCardProps) {
+function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, declineToolCall }: ToolCallCardProps) {
   const [manuallyExpanded, setManuallyExpanded] = useState(false);
   const { mcpServers } = useWorkspace();
 
@@ -1327,8 +1368,8 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMes
   if (isQueued) { statusText = 'Queued'; statusColor = 'text-muted-foreground'; }
   else if (isActiveApproval) { statusText = 'Waiting'; statusColor = 'text-primary animate-pulse'; }
   else if (isExecuting) { statusText = 'Executing...'; statusColor = 'text-primary animate-pulse'; }
-  else if (isResult && hasError) { statusText = 'Error'; statusColor = 'text-destructive'; }
   else if (isResult && result?.error === 'User declined tool execution.') { statusText = 'Declined'; statusColor = 'text-muted-foreground'; }
+  else if (isResult && hasError) { statusText = 'Error'; statusColor = 'text-destructive'; }
   else if (isResult) { statusText = 'Success'; statusColor = 'text-emerald-500'; }
 
   // Server attribution: direct id first, then match by known tool names
@@ -1416,12 +1457,7 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, setMes
           <button
             onClick={(e) => {
               e.stopPropagation();
-              setMessages((prev: Message[]) => prev.map((m: Message) => m.id === msgId ? {
-                ...m,
-                toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) => ti.toolCallId === toolCall.toolCallId ? {
-                  ...ti, state: 'result' as const, result: { error: 'User declined tool execution.' }
-                } : ti)
-              } : m));
+              declineToolCall(msgId, toolCall.toolCallId);
             }}
             className="flex-[1] border border-border/60 bg-background hover:bg-muted text-foreground font-bold py-1.5 rounded-lg transition-colors cursor-pointer text-[11px]"
           >
