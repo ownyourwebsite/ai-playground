@@ -3,6 +3,8 @@ export type InputSchema = {
   type: "object";
   properties?: Record<string, unknown>;
   required?: string[];
+  /** Preserve JSON Schema keywords/dialects and MCP extensions verbatim. */
+  [keyword: string]: unknown;
 };
 
 /** A tool exposed by a connected MCP server. */
@@ -27,13 +29,65 @@ export type ToolInvocation = {
   originalName?: string;
   serverId?: string;
   turnCount?: number;
+  outcome?: "success" | "declined" | "error" | "unknown";
+  attemptId?: string;
 };
+
+export type Usage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+};
+
+export type ChatError = {
+  category: "app-rate-limit" | "redis-unavailable" | "provider-rate-limit" | "quota" | "context" | "auth" | "provider" | "network" | "timeout" | "interrupted" | "response-limit" | "content-filter" | "protocol" | "mcp" | "storage" | "attachment" | "request" | "tool-schema" | "image-incompatible" | "model-not-found";
+  message: string;
+  retryable: boolean;
+  retryAt?: number;
+  /** Allow-listed diagnostic code only; never a raw provider/storage message. */
+  code?: string;
+};
+
+export type Execution = {
+  sessionId: string;
+  runId: string;
+  stepId: string;
+  attemptId: string;
+  status: "waiting" | "streaming" | "approval" | "tools" | "pending-model" | "retry-wait" | "complete" | "error" | "cancelled" | "interrupted";
+  startedAt: number;
+  durationMs?: number;
+  usage?: Usage;
+  error?: ChatError;
+  retryAt?: number;
+  retryNumber?: number;
+  recovered?: boolean;
+  /** Results received; only the next model step may be resumed, never MCP replay. */
+  continuationPending?: boolean;
+  /** False at a pre-request checkpoint or a terminal unsent attempt; absent for legacy/uncertain recovery. */
+  requestSent?: boolean;
+  interruption?: "user" | "session-switch" | "page-exit" | "reload" | "step-limit";
+};
+
+/** Lightweight metadata kept with a message; payloads are stored separately. */
+export type AttachmentRef = {
+  id: string;
+  name: string;
+  kind: 'text' | 'image';
+  mediaType: string;
+  size: number;
+};
+
+/** UTF-8 decoded text, or a complete, strict raster image data URL. */
+export type AttachmentRecord = AttachmentRef & { data: string };
 
 export type Message = {
   id: string;
   role: "user" | "assistant" | "system" | "data" | "tool";
   content: string;
   toolInvocations?: ToolInvocation[];
+  attachments?: AttachmentRef[];
   /** Extracted reasoning / "thinking" content (from <think> tags or a dedicated API field). */
   reasoning?: string | null;
   /** True while a reasoning block is still streaming (open tag, no close yet). */
@@ -42,6 +96,7 @@ export type Message = {
   error?: string;
   /** Ephemeral status line shown while the assistant is working. */
   statusLine?: string;
+  execution?: Execution;
 };
 
 export type Session = {
@@ -140,6 +195,8 @@ export type ChatRequestBody = {
   model: string;
   systemPrompt?: string;
   ollamaUrl?: string;
-  messages: Array<Pick<Message, "role" | "content" | "toolInvocations">>;
+  messages: Array<Pick<Message, "role" | "content" | "toolInvocations"> & { attachments?: AttachmentRecord[] }>;
   enabledTools: ChatRequestTool[];
+  /** @deprecated Accepted for older clients; has no effect on image compatibility. */
+  imageSupportAcknowledged?: boolean;
 };

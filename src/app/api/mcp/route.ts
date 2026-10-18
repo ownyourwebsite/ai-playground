@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkRateLimit } from "@/lib/rateLimit";
+import { checkRateLimit, rateLimitErrorResponse } from "@/lib/rateLimit";
 import { ssrfGuardedFetch, assertUrlIsPublic } from "@/lib/ssrf";
 
 export const runtime = "nodejs";
@@ -59,10 +59,8 @@ function getBodyHeaderCaseInsensitive(
 }
 
 export async function POST(req: NextRequest) {
-  const rl = await checkRateLimit(req, "mcp");
-  if (!rl.allowed) {
-    return jsonError("Rate limit exceeded. Try again in a minute.", 429, { "Retry-After": "60" });
-  }
+  const rateLimitError = rateLimitErrorResponse(await checkRateLimit(req, "mcp"));
+  if (rateLimitError) return rateLimitError;
 
   try {
     const { url, method = "POST", headers = {}, body } = await req.json();
@@ -178,6 +176,7 @@ export async function POST(req: NextRequest) {
         method,
         headers: safeHeaders,
         body: method !== "GET" && method !== "HEAD" ? JSON.stringify(upstreamBody) : undefined,
+        signal: req.signal,
         timeoutMs: UPSTREAM_TIMEOUT_MS,
         maxBytes: MAX_RESPONSE_BYTES,
       });
@@ -254,11 +253,10 @@ export async function POST(req: NextRequest) {
       if (error.code === "EBLOCKED" || error.message?.includes("private")) {
         return jsonError("Access to private or non-HTTPS URLs is restricted", 403);
       }
-      return jsonError(`Connection failed: ${error.message}`, 502);
+      return jsonError("MCP connection failed; operation outcome may be unknown.", 502);
     }
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return jsonError(message, 500);
+    void error;
+    return jsonError("MCP request failed.", 500);
   }
 }
-

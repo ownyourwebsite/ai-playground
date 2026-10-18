@@ -1,4 +1,5 @@
 "use client";
+import { summarizeUsage } from "@/lib/chat/execution";
 
 import React, { useState } from "react";
 import {
@@ -35,12 +36,11 @@ export default function RightPanel() {
     settings,
     updateSettings,
     selectedModel,
-    tokensCount,
-    latency,
     messages,
     rawRequestJson,
     rawResponseJson,
   } = useWorkspace();
+  const usage = summarizeUsage(messages);
 
   // Custom MCP Adding State
   const [newMcpName, setNewMcpName] = useState("");
@@ -209,8 +209,11 @@ export default function RightPanel() {
     }
   };
 
-  const currentSnippet =
-    snippetType === "curl"
+  const hasAttachments = messages.some(message => message.attachments?.length);
+  const requestHasAttachments = rawRequestJson?.messages.some(message => message.attachments?.length);
+  const currentSnippet = hasAttachments
+    ? '// Attachment-aware snippet export is not available yet. No runnable request is generated: files must never be silently omitted.'
+    : snippetType === "curl"
       ? generateCurl("openai", selectedModel, messages, settings.openAiKey || "", settings.systemPrompt)
       : generateTypeScript("openai", selectedModel, messages, settings.systemPrompt);
 
@@ -274,6 +277,7 @@ export default function RightPanel() {
                 <pre className="p-3 text-[11px] text-muted-foreground overflow-x-auto font-mono leading-relaxed max-h-[150px]">
                   {rawRequestJson ? JSON.stringify(rawRequestJson, null, 2) : "// No request made yet"}
                 </pre>
+                {requestHasAttachments && <p className="px-3 pb-3 text-[10px] text-muted-foreground">Attachment contents are redacted here and in this Copy button. The real request includes the full files; this diagnostic copy is not replayable.</p>}
               </div>
             </div>
 
@@ -329,11 +333,13 @@ export default function RightPanel() {
                 <div className="bg-muted/40 px-3 py-2 text-xs font-medium border-b border-border flex justify-between items-center">
                   <span className="text-foreground">{snippetType === "curl" ? "curl-command.sh" : "ai-sdk.ts"}</span>
                   <button
+                    disabled={hasAttachments}
+                    title={hasAttachments ? 'Snippet export does not yet include attachments.' : 'Copy snippet'}
                     onClick={() => {
                       navigator.clipboard.writeText(currentSnippet);
                       alert("Snippet copied!");
                     }}
-                    className="text-muted-foreground hover:text-foreground transition-colors text-[11px] font-medium cursor-pointer"
+                    className="text-muted-foreground hover:text-foreground transition-colors text-[11px] font-medium cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     Copy
                   </button>
@@ -344,6 +350,11 @@ export default function RightPanel() {
               </div>
             </div>
 
+            <div className="text-xs text-muted-foreground">
+              {usage.pending ? 'Usage pending · ' : ''}{usage.incomplete ? 'Incomplete — known usage only' : 'Provider-reported usage'}
+              <br />Last request: input {usage.last?.usage?.inputTokens ?? 'unknown'} / output {usage.last?.usage?.outputTokens ?? 'unknown'} / total {usage.last?.usage?.totalTokens ?? 'unknown'}
+              <br />Cache read (included): {usage.last?.usage?.cachedTokens ?? 'unknown'} · Reasoning (included): {usage.last?.usage?.reasoningTokens ?? 'unknown'}
+            </div>
             {/* Metrics */}
             <div className="space-y-2">
               <h3 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider px-1">
@@ -352,12 +363,12 @@ export default function RightPanel() {
               <div className="rounded-xl border border-border bg-background shadow-sm overflow-hidden">
                 <div className="p-3 text-xs grid grid-cols-2 gap-4">
                   <div className="space-y-1">
-                    <div className="text-muted-foreground">Tokens</div>
-                    <div className="text-xl font-semibold text-foreground">{tokensCount}</div>
+                    <div className="text-muted-foreground">Tokens · session</div>
+                    <div className="text-xl font-semibold text-foreground">{usage.total ?? 'Unknown'}</div>
                   </div>
                   <div className="space-y-1">
-                    <div className="text-muted-foreground">Latency</div>
-                    <div className="text-xl font-semibold text-foreground">{latency ? `${latency}ms` : "—"}</div>
+                    <div className="text-muted-foreground">Last request duration</div>
+                    <div className="text-xl font-semibold text-foreground">{usage.last?.durationMs === undefined ? '—' : `${usage.last!.durationMs}ms`}</div>
                   </div>
                 </div>
               </div>

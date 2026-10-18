@@ -242,6 +242,7 @@ export async function isUrlSsrfSafe(urlStr: string): Promise<boolean> {
 /* ------------------------------------------------------------------ */
 
 export interface GuardedFetchOptions {
+  signal?: AbortSignal;
   method?: string;
   headers?: Record<string, string>;
   body?: string | null;
@@ -337,6 +338,7 @@ export function ssrfGuardedFetch(
             // Keep TLS SNI / certificate validation tied to the hostname.
             servername: url.protocol === "https:" ? stripBrackets(url.hostname) : undefined,
             timeout: timeoutMs,
+            signal: opts.signal,
           },
           (res) => {
             const chunks: Buffer[] = [];

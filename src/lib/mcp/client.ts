@@ -163,7 +163,7 @@ async function rawSendMcpRequest(
   authHeaders: Record<string, string> | undefined,
   method: string,
   params: Record<string, unknown> | undefined,
-  options: { withSession: boolean; protocolVersion?: string } = {
+  options: { withSession: boolean; protocolVersion?: string; signal?: AbortSignal } = {
     withSession: true,
   }
 ): Promise<unknown> {
@@ -187,7 +187,7 @@ async function rawSendMcpRequest(
     params === undefined && method.startsWith("notifications/");
   const rpcBody: Record<string, unknown> = { jsonrpc: "2.0", method };
   if (!isNotification) {
-    rpcBody.id = Math.floor(Math.random() * 1000000);
+    rpcBody.id = crypto.randomUUID();
     // initialize keeps its legacy top-level protocolVersion shape; every
     // other method carries the version per-request via _meta.
     rpcBody.params =
@@ -202,89 +202,95 @@ async function rawSendMcpRequest(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FRONTEND_TIMEOUT_MS);
 
-  let response: Response;
   try {
-    response = await fetch("/api/mcp", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        url,
+    let response: Response;
+    try {
+      response = await fetch("/api/mcp", {
         method: "POST",
-        headers,
-        body: rpcBody,
-      }),
-      signal: controller.signal,
-    });
-  } catch (err: unknown) {
-    if (err instanceof Error && err.name === "AbortError") {
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url,
+          method: "POST",
+          headers,
+          body: rpcBody,
+        }),
+        signal: options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new Error(
+          `MCP request timed out after ${FRONTEND_TIMEOUT_MS}ms (${method})`
+        );
+      }
+      throw err instanceof Error
+        ? new Error(`MCP request failed (${method}): ${err.message}`)
+        : new Error(`MCP request failed (${method}): ${String(err)}`);
+    }
+
+    if (!response.ok) {
+      const errData = (await response.json().catch(() => ({}))) as ProxyErrorBody;
+      // The proxy forwards the upstream status as-is; upstream JSON-RPC errors
+      // arrive as objects {code, message} — never pass an object to Error().
+      const detail = errorPayloadToMessage(
+        errData.error ?? errData.message,
+        `Proxy error: ${response.status} ${response.statusText}`
+      );
       throw new Error(
-        `MCP request timed out after ${FRONTEND_TIMEOUT_MS}ms (${method})`
+        `Proxy error ${response.status} ${response.statusText}: ${detail}`
       );
     }
-    throw err instanceof Error
-      ? new Error(`MCP request failed (${method}): ${err.message}`)
-      : new Error(`MCP request failed (${method}): ${String(err)}`);
-  } finally {
-    clearTimeout(timeout);
-  }
 
-  if (!response.ok) {
-    const errData = (await response.json().catch(() => ({}))) as ProxyErrorBody;
-    // The proxy forwards the upstream status as-is; upstream JSON-RPC errors
-    // arrive as objects {code, message} — never pass an object to Error().
-    const detail = errorPayloadToMessage(
-      errData.error ?? errData.message,
-      `Proxy error: ${response.status} ${response.statusText}`
-    );
-    throw new Error(
-      `Proxy error ${response.status} ${response.statusText}: ${detail}`
-    );
-  }
+    // Persist the session id (if any) for subsequent legacy requests.
+    const newSessionId = response.headers.get("mcp-session-id");
+    if (newSessionId) {
+      sessionIds.set(url, newSessionId);
+    }
 
-  // Persist the session id (if any) for subsequent legacy requests.
-  const newSessionId = response.headers.get("mcp-session-id");
-  if (newSessionId) {
-    sessionIds.set(url, newSessionId);
-  }
-
-  // Notifications may be answered with an empty or non-JSON body (e.g. 202 Accepted).
-  const responseText = await response.text();
-  if (!responseText.trim()) {
-    return undefined;
-  }
-  let data: JsonRpcResponse;
-  try {
-    data = JSON.parse(responseText) as JsonRpcResponse;
-  } catch {
-    if (response.status >= 200 && response.status < 300) {
+    // Notifications may be answered with an empty or non-JSON body (e.g. 202 Accepted).
+    const responseText = await response.text();
+    if (!responseText.trim()) {
+      if (method === 'tools/call') throw new Error('Missing MCP result; outcome unknown');
       return undefined;
     }
-    throw new Error(
-      `Proxy returned invalid JSON: ${response.status} ${response.statusText}`
-    );
-  }
-  if (data.error) {
-    throw new Error(errorPayloadToMessage(data.error, "MCP request failed"));
-  }
+    let data: JsonRpcResponse;
+    try {
+      data = JSON.parse(responseText) as JsonRpcResponse;
+    } catch {
+      if (response.status >= 200 && response.status < 300) {
+        if (method === 'tools/call') throw new Error('Invalid MCP result; outcome unknown');
+        return undefined;
+      }
+      throw new Error(
+        `Proxy returned invalid JSON: ${response.status} ${response.statusText}`
+      );
+    }
+    if (data.error) {
+      throw new Error(errorPayloadToMessage(data.error, "MCP request failed"));
+    }
 
-  return data.result;
+    if (method === 'tools/call' && data.result === undefined) throw new Error('Missing MCP result; outcome unknown');
+    return data.result;
+  } finally { clearTimeout(timeout); }
 }
 
 async function notifyInitialized(
   url: string,
-  authHeaders?: Record<string, string>
+  authHeaders?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<void> {
   await rawSendMcpRequest(url, authHeaders, "notifications/initialized", undefined, {
     withSession: true,
     protocolVersion: LEGACY_PROTOCOL_VERSION,
+    signal,
   });
 }
 
 async function legacyInitialize(
   url: string,
-  authHeaders?: Record<string, string>
+  authHeaders?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<unknown> {
   const result = await rawSendMcpRequest(
     url,
@@ -298,18 +304,16 @@ async function legacyInitialize(
         version: "1.0.0",
       },
     },
-    { withSession: true, protocolVersion: LEGACY_PROTOCOL_VERSION }
+    { withSession: true, protocolVersion: LEGACY_PROTOCOL_VERSION, signal }
   );
 
   // Per the pre-2026 spec, the client MUST send notifications/initialized
   // after a successful initialize. A failure here must not break the connection.
   try {
-    await notifyInitialized(url, authHeaders);
-  } catch (err) {
-    console.warn(
-      "Failed to send notifications/initialized:",
-      err instanceof Error ? err.message : String(err)
-    );
+    await notifyInitialized(url, authHeaders, signal);
+  } catch {
+    signal?.throwIfAborted();
+    console.warn('[MCP] initialized notification unavailable');
   }
 
   legacyInitialized.add(url);
@@ -318,10 +322,11 @@ async function legacyInitialize(
 
 async function ensureLegacyInitialized(
   url: string,
-  authHeaders?: Record<string, string>
+  authHeaders?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<void> {
   if (legacyInitialized.has(url)) return;
-  await legacyInitialize(url, authHeaders);
+  await legacyInitialize(url, authHeaders, signal);
 }
 
 /**
@@ -335,17 +340,16 @@ async function ensureLegacyInitialized(
  */
 export async function discoverMcpCapabilities(
   url: string,
-  authHeaders?: Record<string, string>
+  authHeaders?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<unknown | null> {
   try {
     return await rawSendMcpRequest(url, authHeaders, "server/discover", {}, {
       withSession: false,
+      signal,
     });
-  } catch (err) {
-    console.warn(
-      "server/discover not supported, continuing without discovery:",
-      err instanceof Error ? err.message : String(err)
-    );
+  } catch {
+    signal?.throwIfAborted();
     return null;
   }
 }
@@ -354,8 +358,19 @@ export async function sendMcpRequest(
   url: string,
   authHeaders: Record<string, string> | undefined,
   method: string,
-  params?: Record<string, unknown>
+  params?: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<unknown> {
+  // Never negotiate/replay after sending an operation. Discovery is read-only.
+  if (method === 'tools/call') {
+    signal?.throwIfAborted();
+    if (!transportModes.has(url)) await initializeMcp(url, authHeaders, signal);
+    signal?.throwIfAborted();
+    const legacy = transportModes.get(url) !== 'stateless';
+    return rawSendMcpRequest(url, authHeaders, method, params, {
+      withSession: legacy, protocolVersion: legacy ? LEGACY_PROTOCOL_VERSION : MCP_PROTOCOL_VERSION, signal,
+    });
+  }
   // Legacy handshake methods always go direct (no fallback loop).
   if (method === "initialize" || method.startsWith("notifications/")) {
     return rawSendMcpRequest(url, authHeaders, method, params, {
@@ -366,7 +381,7 @@ export async function sendMcpRequest(
 
   const cached = transportModes.get(url);
   if (cached === "legacy") {
-    await ensureLegacyInitialized(url, authHeaders);
+    await ensureLegacyInitialized(url, authHeaders, signal);
     return rawSendMcpRequest(url, authHeaders, method, params, {
       withSession: true,
       protocolVersion: LEGACY_PROTOCOL_VERSION,
@@ -382,7 +397,7 @@ export async function sendMcpRequest(
   // Only when the server explicitly rejects `initialize` as unknown (-32601 /
   // method-not-found / 404 / 501) do we fall through to the stateless probe.
   try {
-    await ensureLegacyInitialized(url, authHeaders);
+    await ensureLegacyInitialized(url, authHeaders, signal);
     const result = await rawSendMcpRequest(url, authHeaders, method, params, {
       withSession: true,
       protocolVersion: LEGACY_PROTOCOL_VERSION,
@@ -427,23 +442,26 @@ export async function sendMcpRequest(
  */
 export async function initializeMcp(
   url: string,
-  authHeaders?: Record<string, string>
+  authHeaders?: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<unknown> {
+  signal?.throwIfAborted();
   const cached = transportModes.get(url);
   if (cached === "legacy") {
-    return legacyInitialize(url, authHeaders);
+    return legacyInitialize(url, authHeaders, signal);
   }
   if (cached === "stateless") {
     return { mode: "stateless", resumed: true };
   }
 
   try {
-    const legacyResult = await legacyInitialize(url, authHeaders);
+    const legacyResult = await legacyInitialize(url, authHeaders, signal);
     transportModes.set(url, "legacy");
     // Best-effort discovery after a working connection; never throws.
-    await discoverMcpCapabilities(url, authHeaders);
+    await discoverMcpCapabilities(url, authHeaders, signal);
     return legacyResult;
   } catch (legacyErr) {
+    signal?.throwIfAborted();
     const message =
       legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
     // Auth / network errors must fail fast — do not mask them with stateless.
@@ -452,9 +470,10 @@ export async function initializeMcp(
     }
     // Server rejected initialize itself -> try stateless tools/list probe.
     try {
-      const discovered = await discoverMcpCapabilities(url, authHeaders);
+      const discovered = await discoverMcpCapabilities(url, authHeaders, signal);
       await rawSendMcpRequest(url, authHeaders, "tools/list", {}, {
         withSession: false,
+        signal,
       });
       transportModes.set(url, "stateless");
       return { mode: "stateless", capabilities: discovered };
@@ -492,13 +511,14 @@ export async function callMcpTool(
   url: string,
   authHeaders: Record<string, string> | undefined,
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<McpCallResult> {
   try {
     return (await sendMcpRequest(url, authHeaders, "tools/call", {
       name,
       arguments: args,
-    })) as McpCallResult;
+    }, signal)) as McpCallResult;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(

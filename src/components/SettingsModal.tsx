@@ -1,20 +1,31 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { Sliders, X, Check, ChevronDown, Trash2, Plus, Monitor, Sun, Moon } from "lucide-react";
 import { useWorkspace, WorkspaceTheme } from "@/context/WorkspaceContext";
 import { AppSettings, SavedProvider } from "@/lib/types";
 
-export default function SettingsModal() {
-  const { isSettingsOpen } = useWorkspace();
+export default function SettingsModal({ onRestoreBackup }: { onRestoreBackup: () => void }) {
+  const { isSettingsOpen, setIsSettingsOpen, settingsReady } = useWorkspace();
 
   // Gate rendering so the form remounts with fresh state on every open.
   if (!isSettingsOpen) return null;
-  return <SettingsForm />;
+  if (!settingsReady) return <div className="fixed inset-0 z-50 grid place-items-center bg-background/80 backdrop-blur-sm p-4">
+    <div role="dialog" aria-modal="true" aria-label="Configuration Settings" className="w-full max-w-md rounded-2xl border border-border bg-background p-5 space-y-4">
+      <p role="status" className="text-sm">Loading settings…</p>
+      <div className="flex flex-wrap gap-2 text-xs">
+        <button type="button" onClick={onRestoreBackup} className="border rounded-lg px-3 py-2 cursor-pointer">Restore backup</button>
+        <button type="button" onClick={() => setIsSettingsOpen(false)} className="border rounded-lg px-3 py-2 cursor-pointer">Close settings</button>
+      </div>
+    </div>
+  </div>;
+  return <SettingsForm onRestoreBackup={onRestoreBackup} />;
 }
 
-function SettingsForm() {
-  const { setIsSettingsOpen, settings, updateSettings, setSelectedModel, theme, setTheme } = useWorkspace();
+function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
+  const { setIsSettingsOpen, settings, settingsLoadFailed, settingsError, updateSettings, setSelectedModel, theme, setTheme } = useWorkspace();
+  const [isSaving, setIsSaving] = useState(false);
+  const [providerNotice, setProviderNotice] = useState('');
 
   const [systemPrompt, setSystemPrompt] = useState(settings.systemPrompt || "");
   const [customBaseUrl, setCustomBaseUrl] = useState(settings.customBaseUrl || "");
@@ -37,9 +48,16 @@ function SettingsForm() {
   const [rememberKeys, setRememberKeys] = useState(settings.rememberKeys || false);
 
   const [isPopularOpen, setIsPopularOpen] = useState(false);
+  const initialForm = useRef<Partial<AppSettings>>({
+    systemPrompt, customBaseUrl, customKey, customModel, openAiKey, openAiModel,
+    anthropicKey, anthropicModel, groqKey, groqModel, ollamaUrl, ollamaModel,
+    githubWriteMode, rememberKeys, savedProviders,
+  });
 
-  const handleSave = () => {
-    const newSettings: Partial<AppSettings> = {
+  const handleSave = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    let newSettings: Partial<AppSettings> = {
       systemPrompt,
       customBaseUrl,
       customKey,
@@ -56,6 +74,16 @@ function SettingsForm() {
       rememberKeys,
       savedProviders,
     };
+    if (settingsLoadFailed) {
+      // Unknown persisted values must not be replaced by the empty form shown
+      // after a failed read. Carry only explicit edits into later recovery.
+      newSettings = Object.fromEntries(Object.entries(newSettings).filter(([key, value]) => {
+        const before = initialForm.current[key as keyof AppSettings];
+        return key === 'savedProviders'
+          ? JSON.stringify(value) !== JSON.stringify(before ?? [])
+          : value !== before;
+      })) as Partial<AppSettings>;
+    }
 
     // Auto-switch provider if exactly one key is provided and no others
     const providedKeys = [
@@ -70,11 +98,13 @@ function SettingsForm() {
       newSettings.defaultModel = providedKeys[0].model;
     }
 
-    updateSettings(newSettings);
-    setIsSettingsOpen(false);
+    const saved = await updateSettings(newSettings);
+    setIsSaving(false);
+    if (saved) setIsSettingsOpen(false);
   };
 
-  const handleSaveCustomProvider = () => {
+  const handleSaveCustomProvider = async () => {
+    if (isSaving) return;
     if (!customBaseUrl) {
       alert("Please enter a Base URL");
       return;
@@ -95,26 +125,30 @@ function SettingsForm() {
     setSelectedModel(`custom-${newProvider.id}`);
 
     // Save it to settings in-memory immediately as well
-    updateSettings({
-      ...settings,
+    setIsSaving(true);
+    const saved = await updateSettings({
       savedProviders: updated,
-      defaultModel: `custom-${newProvider.id}`
+      defaultModel: `custom-${newProvider.id}`,
+      rememberKeys,
     });
-
+    setIsSaving(false);
     setCustomName("");
-    alert(`Saved and selected "${name}"!`);
+    setProviderNotice(saved ? `Saved and selected “${name}”.` : `“${name}” is selected for this tab. Local saving failed; retry before closing.`);
   };
 
   return (
     <div className="fixed inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-background border border-border rounded-2xl w-full max-w-md shadow-lg flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+      <div role="dialog" aria-modal="true" aria-labelledby="settings-heading" className="bg-background border border-border rounded-2xl w-full max-w-md shadow-lg flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+        {settingsError && <p role="alert" className="p-4 pb-0 text-xs text-amber-700 dark:text-amber-400">{settingsError}</p>}
+        {providerNotice && <p role="status" className="p-4 pb-0 text-xs text-muted-foreground">{providerNotice}</p>}
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-border bg-muted/10">
           <div className="flex items-center gap-2 font-semibold text-sm">
             <Sliders className="w-4 h-4 text-primary" />
-            <span>Configuration Settings</span>
+            <span id="settings-heading">Configuration Settings</span>
           </div>
           <button
+            aria-label="Close settings"
             onClick={() => setIsSettingsOpen(false)}
             className="p-1.5 hover:bg-muted rounded-md text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
           >
@@ -201,8 +235,9 @@ function SettingsForm() {
                 />
               </div>
               <button
-                type="button"
-                onClick={handleSaveCustomProvider}
+                    type="button"
+                    onClick={handleSaveCustomProvider}
+                    disabled={isSaving}
                 className="bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold py-1.5 px-3 rounded-lg transition-colors cursor-pointer shrink-0 flex items-center gap-1 h-7.5"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -466,7 +501,9 @@ function SettingsForm() {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-4 bg-muted/20 border-t border-border flex items-center justify-end gap-2">
+        <div className="px-5 py-4 bg-muted/20 border-t border-border flex flex-wrap items-center justify-end gap-2">
+          <button type="button" onClick={onRestoreBackup}
+            className="mr-auto px-2 py-2 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted rounded-xl transition-colors cursor-pointer">Restore backup</button>
           <button
             onClick={() => setIsSettingsOpen(false)}
             className="px-4 py-2 text-sm font-semibold text-muted-foreground hover:text-foreground hover:bg-muted rounded-xl transition-all cursor-pointer"
@@ -475,10 +512,11 @@ function SettingsForm() {
           </button>
           <button
             onClick={handleSave}
+            disabled={isSaving}
             className="px-4 py-2 bg-primary text-primary-foreground hover:bg-primary/90 rounded-xl text-sm font-semibold shadow-sm transition-all flex items-center gap-1.5 cursor-pointer"
           >
             <Check className="w-4 h-4" />
-            Save Changes
+            {isSaving ? 'Saving…' : 'Save Changes'}
           </button>
         </div>
       </div>

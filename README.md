@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Next.js](https://img.shields.io/badge/Next.js-16.3-black)](https://nextjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue)](https://www.typescriptlang.org/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](.github/CONTRIBUTING.md)
 
 A developer-first, local-first LLM playground that integrates the Model Context Protocol (MCP) directly into your browser. Configure models, connect remote/hosted MCP servers, trace request/response payloads in raw JSON, and export production-ready snippets in seconds.
 
@@ -15,8 +15,9 @@ A developer-first, local-first LLM playground that integrates the Model Context 
 - **GitHub Write Mode:** Toggle write actions (create/update/delete) for the GitHub MCP to save prompt tokens and fit within lower-tier model limits.
 - **Dynamic Provider & Model Selection:** Define custom model strings for any popular provider, or add entirely custom Base URLs directly in the settings. The UI dynamically detects your configured keys and offers them as selectable models without manual toggling.
 - **Local-First / Private:** All keys, prompt templates, and chat histories are stored inside your browser's **IndexedDB**. Keys are held in memory and forwarded per-request to the model provider — they are never persisted server-side.
-- **Automatic Key Expiry:** Remembered API keys auto-expire after 30 days without being refreshed, so a forgotten browser profile doesn't keep your secrets indefinitely.
+- **Key Remembering & Expiry:** Secrets can stay session-only; timestamped top-level API keys and the GitHub PAT expire after 30 days unless their fields are saved again. Legacy keys without expiry and saved custom-provider keys are not automatically expired.
 - **Real-time Streaming & Metrics:** Smooth stream processing for all providers. Track estimated token usage (including MCP schema overhead) and API latency in real-time.
+- **Local Attachments:** Preview UTF-8 text/source files and PNG/JPEG/WebP images before sending. Image-support hints are optional and dismissible, never permission gates; the provider decides whether to accept images. Provider charges/quotas still apply. See [attachment limits and safety](docs/attachments.md).
 - **Hosted MCP Presets (GitHub):** Wire up the official hosted GitHub copilot MCP endpoint (`https://api.githubcopilot.com/mcp/`) natively using your GitHub PAT.
 - **Custom remote MCPs:** Proxy JSON-RPC requests safely using an SSRF-shielded HTTP proxy.
 - **Developer Diagnostics:** Inspect exact raw payload requests and stream responses. Export fully-typed TypeScript (Vercel AI SDK) and curl commands instantly.
@@ -27,13 +28,23 @@ A developer-first, local-first LLM playground that integrates the Model Context 
 
 ### 1. Run the App Locally
 
+Use Node.js **22.23.3**, pinned in [.node-version](.node-version), and install the locked dependency versions:
+
 ```bash
-npm install
+npm ci
 cp .env.example .env.local   # optional: configure environment variables (see below)
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) to view the workspace.
+
+#### Deploy your own instance on Vercel
+
+1. Fork this repository, then import your fork into Vercel as a Next.js project. Use the repository root and the default build/output settings; select Node.js **22.x**.
+2. Provider keys are entered in the application's Settings, not committed or added as deployment secrets. For a public instance, configure the optional hosting variables from [the environment example](.env.example): supply both Upstash Redis credentials, set `RATE_LIMIT_REQUIRED=1`, and keep `RATE_LIMIT_FAIL_OPEN=0`. Never enable `ALLOW_PRIVATE_MCP` on a public deployment.
+3. Deploy, open your new URL and configure your providers. Review the [hosting security guidance](.github/SECURITY.md#hosted-deployments--token-passthrough) before accepting other users' keys. Dependency audit results and abuse protections need a separate review; a successful build is not a security certification.
+
+Chats and keys belong to the browser and origin where they were saved; they do not automatically transfer from localhost or the demo to your deployment. The recovery import transfers backed-up chats/files, not provider keys. A hosted instance also cannot reach Ollama on your computer through its own localhost.
 
 ### 2. Enter API Keys (BYOK)
 
@@ -43,7 +54,7 @@ Open [http://localhost:3000](http://localhost:3000) to view the workspace.
    - **Anthropic** (`sk-ant-...`)
    - **Groq** (`gsk_...`)
    - **Ollama** (defaults to local `http://127.0.0.1:11434/api`)
-3. Optional: Enable **Remember keys on this device** to persist keys inside your IndexedDB.
+3. **Remember keys on this device** defaults on and stores secrets as plain text in IndexedDB. Turn it off to keep secrets in this tab only; saved provider definitions remain, without their keys. Expiry is checked on load, not a background deletion timer. Saving a top-level key field refreshes its 30-day timestamp; older keys without a timestamp are preserved. Saved custom-provider keys have no per-key expiry.
 
 ### 3. Connect GitHub MCP
 
@@ -90,6 +101,30 @@ adding it directly in the right sidebar.
 2. When the LLM decides to use a tool, it will enter a **"Needs Approval"** state.
 3. Review the tool arguments and click **Confirm & Run** to execute the tool or **Deny** to cancel.
 4. Use the **Manual Tool Runner** in the right sidebar to test individual tools with custom JSON arguments before using them in the agentic loop.
+
+#### Background work, recovery, and local saving
+
+- Hiding a browser tab does not cancel an in-progress model response or an approved tool. Unapproved tools continue waiting for your decision, including after reloading.
+- **Stop**, switching chats, or leaving the page stops client-side waiting. A remote write may already have completed: **Outcome unknown** means verify the repository before proposing another write. Model Retry never automatically replays an MCP operation.
+- Stream errors distinguish response-length limits, content filtering, malformed streams, timeouts, and incomplete responses. Partial text and received tool results remain visible.
+- If IndexedDB cannot save, you can continue and switch chats in temporary mode. Unsaved snapshots stay in this tab; **Retry saving** retries chats/settings and reports whether anything remains unsaved. **Download unsaved chats** creates a validated v2 recovery copy with full attachment payloads and no provider credentials. Missing files or recovery limits prevent the download rather than creating an incomplete backup. Closing/reloading the tab can lose unsaved changes; a browser warning is best-effort, not a backup.
+- **Restore backup** is always available in Settings and beside the download action in the storage warning. Select a JSON recovery backup (v1 text-only or v2, **32 MiB maximum**, including base64/whitespace), review chat/message/attachment counts, then explicitly **Import**. Cancel writes nothing. Import atomically creates new copies, leaves original chats, RAM-only chats and settings unchanged, imports no keys and runs no models/tools. Unfinished work in the copies is marked interrupted. Success does not switch chats or disturb the current response/draft; **View restored chat** is an optional, explicit switch.
+- Settings show saving errors instead of reporting success. Keep the same browser origin (scheme, host, and port) and browser profile: changing ports or switching between localhost and 127.0.0.1 uses a different local database. A failed read does not prove deletion. If an upgrade is blocked, close other tabs/windows using that address and retry; do not clear site data. Restarting the development server does not itself delete browser data.
+- Model replies support CommonMark and GitHub-flavored Markdown. Raw HTML is not executed and remote images are not loaded. User-selected image attachments are separate local previews, not remote Markdown images.
+- Retry/restart/Clear actions appear at the bottom of chat history, including in short chats, and hide while scrolling up without covering messages.
+
+### 6. Attach Text Files and Images
+
+Use **Add attachments** beside the message field, preview or remove files, then send with or without a text message. Text is read locally; images are sent as real multimodal input, not just filenames. Nothing is sent during selection/preview.
+
+- Privacy, limits and API costs appear on the first paperclip click; confirmation is remembered in this browser for this site. Reopen the notice anytime with the adjacent **Attachment information** button. Dismissal alone does not acknowledge it.
+- Selected files appear as equal compact tiles inside the composer, above the message, in one left-aligned row of up to four. One file never stretches to fill the row. Open a tile for a separate local preview without resizing the composer; close with Escape, the close button or a backdrop click. Each tile has its own remove button and the toolbar shows the file count.
+- Up to **4 files**, **256 KiB per text file**, **1 MiB per image**, **2 MiB per message**, and **4 MB per complete request**, including history and base64. No silent truncation.
+- Choose an image-capable model. Custom/Ollama/unknown IDs and known text-only IDs may show a compact, dismissible hint, remembered for that endpoint/model without API keys. No compatibility checkbox or client-side support gate blocks sending, retrying or continuing historical images. The provider can reject the input; files are never dropped. Format, byte limits and missing-payload checks still apply.
+- Private image previews use browser-local blob URLs, preserve aspect ratio and never pass through the Next.js image optimizer. Text previews still show the first 2,000 characters; full contents are sent.
+- Saved payloads live in a separate IndexedDB store. Temporary-mode recovery downloads include unsaved file payloads; never close the tab before saving or downloading them.
+- Ollama uses its OpenAI-compatible **/v1** chat-completions endpoint; an existing native **/api** URL is normalized automatically. A local vision model and a running Ollama are still required; a hosted app cannot reach Ollama on your computer through its own localhost.
+- PDF/DOCX/OCR, animated images, and attachment-aware code snippet export are **not** included in this version. The inspector explicitly redacts file contents; its diagnostic copy is not a replayable request. Full behavior, privacy, and limitations: [attachment guide](docs/attachments.md).
 
 ---
 
@@ -139,17 +174,23 @@ ones. Everything is stored locally in IndexedDB via `getSkills` / `saveSkill` /
 
 ## ⚙️ Environment Variables
 
-All environment variables are **optional** — the app works out of the box with an empty `.env.local`. See [`.env.example`](.env.example) for placeholders.
+For **local development**, all environment variables are optional — the app works out of the box with an empty `.env.local`. Public deployments must configure abuse protection; see [`.env.example`](.env.example) for placeholders and the [security guidance](.github/SECURITY.md#rate-limiting-and-trusted-proxies) for the trust boundary.
 
 | Variable                     | Default   | Description                                                                                                                                                                                                                                                       |
 | ---------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ALLOW_PRIVATE_MCP`          | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy (and to allow a local Ollama URL on hosted deployments). **Never enable this on a publicly deployed instance** (e.g. Vercel). |
-| `UPSTASH_REDIS_REST_URL`     | _(empty)_ | Upstash Redis REST endpoint. If both Upstash variables are empty, rate limiting is fully disabled. Create a free database at [upstash.com](https://upstash.com) → Redis → REST API details.                                                                       |
+| `UPSTASH_REDIS_REST_URL`     | _(empty)_ | Base HTTPS Upstash REST URL, without `/pipeline` or `/multi-exec`. With both credentials empty and `RATE_LIMIT_REQUIRED=0`, rate limiting is disabled for local use.                                                                                              |
 | `UPSTASH_REDIS_REST_TOKEN`   | _(empty)_ | Upstash Redis REST token (kept server-side only).                                                                                                                                                                                                                 |
-| `RATE_LIMIT_CHAT_PER_MINUTE` | `20`      | Chat requests per minute per IP.                                                                                                                                                                                                                                  |
-| `RATE_LIMIT_MCP_PER_MINUTE`  | `60`      | MCP proxy requests per minute per IP.                                                                                                                                                                                                                             |
+| `RATE_LIMIT_CHAT_PER_MINUTE` | `20`      | Chat requests per 60-second window, per trusted IP or shared bucket.                                                                                                                                                                                              |
+| `RATE_LIMIT_MCP_PER_MINUTE`  | `60`      | MCP proxy requests per 60-second window, per trusted IP or shared bucket.                                                                                                                                                                                         |
+| `RATE_LIMIT_REQUIRED`        | `0`       | Set to `1` on public deployments: absent/incomplete Redis credentials then produce HTTP 503 instead of silently disabling protection.                                                                                                                             |
+| `RATE_LIMIT_FAIL_OPEN`       | `0`       | Configured Redis failures return 503 by default. `1` explicitly permits requests during Redis failures; not recommended for public use. Invalid configuration still fails closed.                                                                                 |
+| `RATE_LIMIT_IP_HEADER`       | _(empty)_ | Operator-selected header containing **one IP**, overwritten by a trusted edge. No header means one shared bucket per scope; visitor forwarding headers are ignored.                                                                                               |
+| `RATE_LIMIT_TIMEOUT_MS`      | `2000`    | Absolute Redis deadline including response body, in milliseconds; positive integer up to 10000.                                                                                                                                                                   |
 
-> **Rate limiting** activates automatically as soon as both Upstash variables are set — no code changes needed. It is implemented against the Upstash REST API with zero extra npm dependencies and **fails open** if Redis is unreachable. Clients are identified by the `x-forwarded-for` / `x-real-ip` headers — make sure your reverse proxy (nginx, Caddy, …) **overwrites** these headers for untrusted requests, otherwise clients can spoof their rate-limit identity. For public deployments (e.g. Vercel), enabling it is recommended.
+> **Rate limiting** uses one atomic Upstash REST transaction for the counter and TTL, with no extra npm dependencies or automatic retries. The 60-second window starts with the first request and is not extended by later requests. Quota exhaustion returns **429** with the remaining window in `Retry-After`; Redis failures return **503** by default. Invalid/incomplete configuration is never silently accepted. All attempts consume quota, including requests later rejected by the handler.
+
+> **Public deployment:** set `RATE_LIMIT_REQUIRED=1`, provide both Redis credentials and leave `RATE_LIMIT_FAIL_OPEN=0`. Without `RATE_LIMIT_IP_HEADER`, all users share the chat/MCP limits separately. For per-IP quotas, choose a header only after verifying that your proxy/hosting edge **overwrites** it with one actual client IP and the origin cannot be reached directly. Comma-separated forwarding chains and missing/invalid selected headers are rejected with 503. The application cannot verify that your reverse proxy is trustworthy; rate limiting does not replace access control or edge-level abuse protection.
 
 > **Ollama URL protection:** on hosted deployments (detected via the `VERCEL` environment variable) a custom Ollama base URL must pass the same SSRF checks as MCP servers — it must be a public HTTPS endpoint. Locally this restriction does not apply, so `http://127.0.0.1:11434/api` keeps working out of the box. If you self-host on a VPS behind a reverse proxy and want the same protection there, restrict `/api/chat` bodies or set up equivalent network-level guards.
 
@@ -157,13 +198,14 @@ All environment variables are **optional** — the app works out of the box with
 
 ## 📚 Documentation
 
-- **[Contributing Guide](CONTRIBUTING.md)** - How to contribute to this project
-- **[Code of Conduct](CODE_OF_CONDUCT.md)** - Our community standards
-- **[Security Policy](SECURITY.md)** - How to report vulnerabilities
+- **[Attachment Guide](docs/attachments.md)** - Supported files, limits, privacy and recovery
+- **[Contributing Guide](.github/CONTRIBUTING.md)** - Development, testing and pull requests
+- **[Code of Conduct](.github/CODE_OF_CONDUCT.md)** - Our community standards
+- **[Security Policy](.github/SECURITY.md)** - Reporting vulnerabilities and hosting safely
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+Contributions are welcome! Please read our [Contributing Guide](.github/CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## 📄 License
 

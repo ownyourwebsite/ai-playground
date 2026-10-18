@@ -11,27 +11,51 @@ import {
   Square,
   ArrowUp,
   Wrench,
+  Info,
+  X,
 } from "lucide-react";
 import { WorkspaceProvider, useWorkspace } from "@/context/WorkspaceContext";
 import Sidebar from "@/components/Sidebar";
 import RightPanel from "@/components/RightPanel";
 import SettingsModal from "@/components/SettingsModal";
-import { getSession, saveSession } from "@/lib/db";
+import RestoreBackupDialog from "@/components/RestoreBackupDialog";
+import { getSession } from "@/lib/db";
+import AttachmentCard from "@/components/AttachmentCard";
+import AttachmentControls from "@/components/AttachmentControls";
+import { ATTACHMENT_ACCEPT, attachmentRef, readAttachment, validateAttachmentSelection } from "@/lib/attachments/client";
+import { getImageSupport, MAX_ATTACHMENTS, MAX_REQUEST_BYTES } from "@/lib/attachments/policy";
+import { forgetSessionAttachments, loadAttachment, persistSessionWithAttachments, stageAttachments } from "@/lib/attachments/store";
+import { createRecoveryExport, MAX_RECOVERY_BYTES, RecoveryStorageError, RecoveryValidationError } from "@/lib/attachments/recovery";
+import { storageErrorCode } from "@/lib/storageErrors";
 import { callMcpTool } from "@/lib/mcp/client";
 import { resolveGithubToolArgs, validateToolArgs } from "@/lib/mcp/utils";
 import { filterGithubTools } from "@/lib/mcp/githubTools";
-import { parseReasoning, stripOpenReasoningTag } from "@/lib/reasoning";
+import { parseReasoning } from "@/lib/reasoning";
 import ReasoningAccordion from "@/components/ReasoningAccordion";
 import Markdown from "@/components/Markdown";
-import { Message, McpServer, McpTool, ToolInvocation, ChatRequestTool, AppSettings, SavedProvider, ChatRequestBody } from "@/lib/types";
+import ExecutionStatus from "@/components/ExecutionStatus";
+import { ChatExecution, canContinueModel, type ModelRequest } from "@/lib/chat/execution";
+import { chatError } from "@/lib/chat/errors";
+import { useChatScroll } from "@/lib/chat/useChatScroll";
+import { canRetryTool } from "@/lib/chat/toolSafety";
+import { AttachmentRecord, Message, McpServer, McpTool, ToolInvocation, AppSettings, SavedProvider, ChatRequestBody, ChatError } from "@/lib/types";
+
+const MODEL_ACTION_CLASS = "text-[10px] font-bold text-muted-foreground hover:text-foreground uppercase tracking-tight px-2 py-1 rounded bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
 
 function WorkspaceContent() {
   const {
     activeSessionId,
     setActiveSessionId,
-    refreshSessions,
+    rememberSession,
+    registerSessionLifecycle,
     settings,
     updateSettings,
+    settingsReady,
+    settingsLoadFailed,
+    settingsError,
+    sessionError,
+    retryWorkspaceStorage,
+    hasUnsavedSettings,
     mcpServers,
     isLeftSidebarOpen,
     setIsLeftSidebarOpen,
@@ -40,23 +64,42 @@ function WorkspaceContent() {
     setIsSettingsOpen,
     selectedModel,
     setSelectedModel,
-    rawRequestJson,
     setRawRequestJson,
     setRawResponseJson,
     messages,
     setMessages,
     input,
     setInput,
-    setTokensCount,
-    setLatency,
   } = useWorkspace();
 
   const [isLoading, setIsLoading] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const { viewport: scrollViewport, content: scrollContent, away: scrollAway, atBottom: scrollAtBottom, latest: scrollLatest } = useChatScroll();
+  const [sessionReady, setSessionReady] = useState(false);
+  const [storageError, setStorageError] = useState<ChatError>();
+  const [unsavedCount, setUnsavedCount] = useState(0);
+  const [isSaving, setIsSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [saveFeedback, setSaveFeedback] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const exportingRef = useRef(false);
+  const [exportError, setExportError] = useState('');
+  const [isRestoreOpen, setIsRestoreOpen] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [loadVersion, setLoadVersion] = useState(0);
+  const [showProviderHint, setShowProviderHint] = useState(false);
+  const [draftAttachments, setDraftAttachments] = useState<AttachmentRecord[]>([]);
+  const draftAttachmentsRef = useRef(draftAttachments);
+  const [attachmentError, setAttachmentError] = useState('');
+  const [readingAttachments, setReadingAttachments] = useState(false);
+  const readingAttachmentsRef = useRef(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const updateDraftAttachments = (records: AttachmentRecord[]) => {
+    draftAttachmentsRef.current = records;
+    setDraftAttachments(records);
+  };
 
   const [showConfirmModal, setShowConfirmModal] = useState(false);
-  const [confirmModalAction, setConfirmModalAction] = useState<"retry" | "clear" | null>(null);
+  const [confirmModalAction, setConfirmModalAction] = useState<"restart" | "clear" | null>(null);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -88,16 +131,8 @@ function WorkspaceContent() {
     stateRef.current = { selectedModel, settings, mcpServers, messages };
   }, [selectedModel, settings, mcpServers, messages]);
 
-  // Estimate the active MCP tools and token overhead
-  const activeServers = mcpServers.filter((s: McpServer) => s.status === "connected");
-  let allEnabledToolsList: McpTool[] = [];
-  activeServers.forEach((server: McpServer) => {
-    let serverTools = server.tools || [];
-    if (server.preset === "github") {
-      serverTools = filterGithubTools(server.tools || [], settings.githubWriteMode === true);
-    }
-    allEnabledToolsList = [...allEnabledToolsList, ...serverTools];
-  });
+  const allEnabledToolsList = mcpServers.filter(s => s.status === 'connected').flatMap(s =>
+    s.preset === 'github' ? filterGithubTools(s.tools || [], settings.githubWriteMode === true) : s.tools || []);
   const estimatedToolsTokenCount = Math.round(JSON.stringify(allEnabledToolsList).length / 4);
 
   // Map selectedModel (UI option) to AI SDK provider & model
@@ -162,8 +197,17 @@ function WorkspaceContent() {
     settings.ollamaUrl,
     settings.ollamaModel,
   ]);
+  const providerUnavailable = !activeOptions.some(option => option.value === selectedModel);
+  const selectedProvider = getProviderAndModel(selectedModel, settings);
+  const imageSupport = getImageSupport(selectedProvider.provider, selectedProvider.model);
+  const hasImages = draftAttachments.some(file => file.kind === 'image') || messages.some(message => message.attachments?.some(file => file.kind === 'image'));
+  const selectedEndpoint = selectedProvider.provider === 'custom'
+    ? (selectedModel.startsWith('custom-') ? settings.savedProviders?.find(provider => provider.id === selectedModel.slice(7))?.baseUrl : settings.customBaseUrl)
+    : selectedProvider.provider === 'ollama' ? settings.ollamaUrl : undefined;
+  const imageHintSelection = imageHintIdentity(selectedProvider.provider, selectedProvider.model, selectedEndpoint);
 
   useEffect(() => {
+    if (!settingsReady || settingsLoadFailed) return;
     if (activeOptions.length > 0) {
       const isValid = activeOptions.some(opt => opt.value === selectedModel);
       if (!isValid) {
@@ -175,703 +219,196 @@ function WorkspaceContent() {
         setSelectedModel("");
       }
     }
-  }, [activeOptions, selectedModel, setSelectedModel, updateSettings]);
+  }, [activeOptions, selectedModel, setSelectedModel, updateSettings, settingsReady, settingsLoadFailed]);
 
-  // Load session messages from DB when activeSessionId changes
+  const [engine] = useState(() => new ChatExecution({
+    publish(next, busy) { setMessages(next); setIsLoading(busy); },
+    storage(error, count) { setStorageError(error); setUnsavedCount(count); },
+    async persist(next, sessionId) {
+      if (!sessionId || !next.some(m => m.role === 'user')) return;
+      const firstUser = next.find(m => m.role === 'user');
+      const session = rememberSession({ id: sessionId, title: firstUser?.content.trim().slice(0, 30) || firstUser?.attachments?.[0]?.name.slice(0, 30) || 'Untitled Session', updatedAt: Date.now(), messages: next });
+      await persistSessionWithAttachments(session);
+    },
+    visible: () => document.visibilityState === 'visible',
+  }));
+  useEffect(() => registerSessionLifecycle({
+    async switch(id) {
+      if ((id || '') === engine.sessionId) return true;
+      setSessionReady(false);
+      try { await engine.prepareSwitch(); return true; }
+      catch { setSessionReady(true); return false; }
+    },
+    beforeDelete: id => engine.detach(id),
+    deleteFailed: id => engine.reattach(id),
+    deleted(id) {
+      forgetSessionAttachments(id);
+      engine.forget(id);
+      if (id === engine.sessionId) engine.reset('', [{ id: 'welcome', role: 'assistant', content: 'Hello! I am ready. You can select a model and configure MCP tools. How can I help you today?' }]);
+    },
+  }), [engine, registerSessionLifecycle]);
   useEffect(() => {
-    async function loadActiveSession() {
-      if (activeSessionId) {
-        const session = await getSession(activeSessionId);
-        if (session) {
-          // Drop only truly malformed invocations (missing ids). Pending
-          // cards (calling / needs-approval / executing) must survive a
-          // reload — otherwise the approval card flashes and vanishes into
-          // "No MCP tool was called" right after the first persist creates
-          // the session id and triggers this reload.
-          const prunedMessages = session.messages.map((m: Message) => {
-            if (m.role === "assistant" && m.toolInvocations) {
-              return {
-                ...m,
-                toolInvocations: m.toolInvocations.filter((ti: ToolInvocation) =>
-                  Boolean(ti.toolCallId) && Boolean(ti.toolName)
-                )
-              };
-            }
-            return m;
-          });
-          // Migrate old messages where an unclosed reasoning tag stored the whole
-          // reply inside `reasoning` and left `content` empty (answer hidden under
-          // the accordion). Surface it back as the visible answer.
-          const migratedMessages = prunedMessages.map((m: Message) => {
-            if (m.role === "assistant" && m.reasoningOpen) {
-              return {
-                ...m,
-                content: m.content || (m.reasoning || ""),
-                reasoning: m.content ? m.reasoning : null,
-                reasoningOpen: false,
-              };
-            }
-            return m;
-          });
-          setMessages(migratedMessages);
-        }
-      } else {
-        setMessages([
-          {
-            id: "welcome",
-            role: "assistant",
-            content: "Hello! I am ready. You can select a model and configure MCP tools. How can I help you today?",
-          },
-        ]);
-      }
+    let stale = false;
+    if ((activeSessionId || '') === engine.sessionId && engine.messages.length > 0) {
+      void Promise.resolve().then(() => { if (!stale) setSessionReady(true); });
+      return () => { stale = true; };
     }
-    loadActiveSession();
-  }, [activeSessionId, setMessages]);
-
-  // Persist session to DB when messages change
-  const persistSession = async (currentMessages: Message[]) => {
-    if (currentMessages.length > 1) {
-      const title = currentMessages.find((m) => m.role === "user")?.content.slice(0, 30) || "Untitled Session";
-      const id = activeSessionId || `session-${Date.now()}`;
-
-      const session = {
-        id,
-        title,
-        updatedAt: Date.now(),
-        messages: currentMessages,
-      };
-
-      await saveSession(session);
-      if (!activeSessionId) {
-        setActiveSessionId(id);
-      }
-      // Refresh the sessions list in the sidebar so the current chat appears immediately
-      refreshSessions();
-    }
-  };
-
-  const stopGeneration = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    setIsLoading(false);
-  };
-
-  const retryLastMessage = () => {
-    if (messages.length === 0 || isLoading) return;
-    setConfirmModalAction("retry");
-    setShowConfirmModal(true);
-  };
-
-  const executeRetry = () => {
-    if (messages.length === 0 || isLoading) return;
-
-    // Find last user message
-    const lastUserMsgIndex = [...messages].reverse().findIndex(m => m.role === "user");
-    if (lastUserMsgIndex === -1) return;
-
-    const actualIndex = messages.length - 1 - lastUserMsgIndex;
-    const userContent = messages[actualIndex].content;
-    const previousMessages = messages.slice(0, actualIndex);
-
-    sendMessage(userContent, previousMessages);
-  };
-
-  const clearChat = () => {
-    setConfirmModalAction("clear");
-    setShowConfirmModal(true);
-  };
-
-  const executeClear = () => {
-    setMessages([
-      {
-        id: "welcome",
-        role: "assistant",
-        content: "Hello! I am ready. You can select a model and configure MCP tools. How can I help you today?",
-      },
-    ]);
-    setActiveSessionId(null);
-  };
-
-  // The custom streaming send function
-  const sendMessage = async (userContent: string | null, currentMessagesList: Message[] = messages, turnCount = 0) => {
-    if (isLoading) return;
-
-    // Use latest state to avoid stale closures
-    const currentSettings = stateRef.current.settings;
-    let currentSelectedModel = stateRef.current.selectedModel;
-    let { provider: currentProvider, model: currentModel } = getProviderAndModel(currentSelectedModel, currentSettings);
-
-    let apiKey = null;
-    let customBaseUrlVal = currentSettings.customBaseUrl || "";
-    let customKeyVal = currentSettings.customKey || "";
-
-    if (currentSelectedModel.startsWith("custom-") && currentSelectedModel !== "custom") {
-      const id = currentSelectedModel.slice(7);
-      const found = currentSettings.savedProviders?.find((p: SavedProvider) => p.id === id);
-      if (found) {
-        apiKey = found.key || "no-key-required"; // fallback if key is empty
-        customBaseUrlVal = found.baseUrl || "";
-        customKeyVal = found.key || "";
-      }
-    } else {
-      apiKey = currentProvider === "openai" ? currentSettings.openAiKey :
-        currentProvider === "anthropic" ? currentSettings.anthropicKey :
-          currentProvider === "groq" ? currentSettings.groqKey :
-            currentProvider === "custom" ? currentSettings.customKey : null;
-    }
-
-    if (currentProvider !== "ollama" && !apiKey) {
-      // Check if we can auto-switch to the only available key
-      const availableKeys = [
-        { key: currentSettings.customKey, model: "custom" },
-        { key: currentSettings.openAiKey, model: "openai" },
-        { key: currentSettings.anthropicKey, model: "anthropic" },
-        { key: currentSettings.groqKey, model: "groq" }
-      ].filter(k => k.key && k.key.trim().length > 0);
-
-      if (availableKeys.length === 1) {
-        // Auto-switch!
-        const newModel = availableKeys[0].model;
-        setSelectedModel(newModel);
-        updateSettings({ defaultModel: newModel });
-        currentSelectedModel = newModel;
-        const mapped = getProviderAndModel(newModel, currentSettings);
-        currentProvider = mapped.provider;
-        currentModel = mapped.model;
-        apiKey = availableKeys[0].key;
-
-        // Push a toast/banner message to the UI
-        const bannerMsg: Message = { id: `sys-${Date.now()}`, role: "assistant", content: `🔄 Auto-switched to ${newModel} because it's the only configured provider.` };
-        currentMessagesList = [...currentMessagesList, bannerMsg];
-      } else {
-        const foundStr = availableKeys.map(k => k.model).join(", ");
-        const currentProviderName = currentProvider === "openai" ? "OpenAI" : currentProvider === "anthropic" ? "Anthropic" : currentProvider === "groq" ? "Groq" : "Custom";
-        const errMsg = `No ${currentProviderName} key. Found: ${foundStr || "none"}. Switch the model in the header or add an ${currentProviderName} key.`;
-        if (userContent) {
-          const userMessage: Message = { id: `user-${Date.now()}`, role: "user", content: userContent };
-          const updatedMessages = [...currentMessagesList.filter(m => m.id !== "welcome"), userMessage];
-          setMessages([...updatedMessages, { id: `err-${Date.now()}`, role: "assistant", content: `⚠️ Configuration Error: ${errMsg}` }]);
-        } else {
-          setMessages([...currentMessagesList, { id: `err-${Date.now()}`, role: "assistant", content: `⚠️ Configuration Error: ${errMsg}` }]);
-        }
-        setInput("");
-        return;
-      }
-    }
-
-    setIsLoading(true);
-
-    const updatedMessages = [...currentMessagesList.filter(m => m.id !== "welcome")];
-    if (userContent) {
-      const userMessage: Message = { id: `user-${Date.now()}`, role: "user", content: userContent };
-      updatedMessages.push(userMessage);
-      setInput("");
-    }
-    setMessages(updatedMessages);
-
-    // Prepare headers and body
-    const reqHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-      "x-openai-key": currentSettings.openAiKey || "",
-      "x-anthropic-key": currentSettings.anthropicKey || "",
-      "x-groq-key": currentSettings.groqKey || "",
-      "x-custom-key": customKeyVal || "",
-      "x-custom-base-url": customBaseUrlVal || "",
+    void (async () => {
+      await Promise.resolve();
+      if (stale) return;
+      setSessionReady(false);
+      try {
+        await engine.prepareSwitch();
+        if (stale) return;
+        const cached = activeSessionId ? engine.snapshot(activeSessionId) : undefined;
+        const session = activeSessionId && !cached ? await getSession(activeSessionId) : undefined;
+        if (stale || (activeSessionId && engine.isDetached(activeSessionId))) return;
+        // Do not destroy the old RAM snapshot until its saves have succeeded.
+        engine.reset(activeSessionId || '', cached || session?.messages || [{ id: 'welcome', role: 'assistant', content: 'Hello! I am ready. You can select a model and configure MCP tools. How can I help you today?' }]);
+        setLoadError(false);
+        setSessionReady(true);
+      } catch { if (!stale) setLoadError(true); }
+    })();
+    return () => { stale = true; };
+  }, [activeSessionId, engine, loadVersion]);
+  useEffect(() => {
+    const unload = () => engine.stop('interrupted', 'page-exit');
+    const warn = (event: BeforeUnloadEvent) => {
+      if (engine.hasUnsavedChanges || hasUnsavedSettings() || draftAttachmentsRef.current.length || readingAttachmentsRef.current) { event.preventDefault(); event.returnValue = ''; }
     };
-
-    // Grab tools from all connected MCP servers
-    const activeServers = stateRef.current.mcpServers.filter((s: McpServer) => s.status === "connected");
-    let allEnabledTools: McpTool[] = [];
-
-    activeServers.forEach((server: McpServer) => {
-      let serverTools = server.tools || [];
-
-      // Allow-list read-only tools unless "GitHub write mode" is explicitly on
-      if (server.preset === "github") {
-        serverTools = filterGithubTools(server.tools || [], currentSettings.githubWriteMode === true);
-      }
-
-      // Namespace tools if more than one server is active
-      if (activeServers.length > 1) {
-        serverTools = serverTools.map((t: McpTool) => ({
-          ...t,
-          originalName: t.name,
-          name: `${server.name.replace(/\s+/g, '_').toLowerCase()}_${t.name}`,
-          serverId: server.id
-        }));
-      } else {
-        serverTools = serverTools.map((t: McpTool) => ({
-          ...t,
-          originalName: t.name,
-          serverId: server.id
-        }));
-      }
-
-      allEnabledTools = [...allEnabledTools, ...serverTools];
+    window.addEventListener('pagehide', unload);
+    window.addEventListener('beforeunload', warn);
+    return () => { window.removeEventListener('pagehide', unload); window.removeEventListener('beforeunload', warn); engine.stop('interrupted', 'page-exit'); };
+  }, [engine, hasUnsavedSettings]);
+  const requestModel: ModelRequest = async (signal, history, attemptId) => {
+    const current = stateRef.current;
+    const { provider, model } = getProviderAndModel(current.selectedModel, current.settings);
+    const saved = current.selectedModel.startsWith('custom-') ? current.settings.savedProviders?.find(p => p.id === current.selectedModel.slice(7)) : undefined;
+    const servers = current.mcpServers.filter(s => s.status === 'connected');
+    const enabledTools = servers.flatMap(server => {
+      const tools = server.preset === 'github' ? filterGithubTools(server.tools || [], current.settings.githubWriteMode === true) : server.tools || [];
+      return tools.map(t => ({ ...t, originalName: t.name, serverId: server.id,
+        name: servers.length > 1 ? `${server.name.replace(/\s+/g, '_').toLowerCase()}_${t.name}` : t.name }));
     });
-
-    const reqBody: ChatRequestBody = {
-      provider: currentProvider,
-      model: currentModel,
-      systemPrompt: currentSettings.systemPrompt,
-      ollamaUrl: currentSettings.ollamaUrl,
-      messages: updatedMessages.map(m => ({ role: m.role, content: m.content, toolInvocations: m.toolInvocations })),
-      enabledTools: allEnabledTools,
+    engine.setToolResolver((call, messages) => {
+      const def = enabledTools.find(t => t.name === call.toolName);
+      const schema = def?.inputSchema || { type: 'object' as const };
+      const args = resolveGithubToolArgs(def?.originalName || call.toolName, call.args, schema, messages);
+      const validation = validateToolArgs(args, schema);
+      return { ...call, args, validation, serverId: def?.serverId, originalName: def?.originalName,
+        state: validation.valid && def ? 'needs-approval' : 'result',
+        ...(!validation.valid || !def ? { outcome: 'error' as const, result: { error: 'Invalid tool arguments or definition. Nothing was executed.' } } : {}),
+      };
+    });
+    const rejectAttachment = (message: string) => {
+      if (!signal.aborted) setAttachmentError(message);
+      return Response.json({ error: chatError('attachment') }, { status: 400 });
     };
-
-    if (process.env.NODE_ENV === 'development') {
-      const estimatedTokens = Math.round(JSON.stringify(allEnabledTools).length / 4);
-      console.log(`[Chat API] Estimated tools payload size: ~${estimatedTokens} tokens`);
-    }
-
-    setRawRequestJson(reqBody);
-
-    abortControllerRef.current = new AbortController();
-    const assistantMessageId = `assistant-${Date.now()}`;
-    const startTime = Date.now();
-
+    let requestMessages: ChatRequestBody['messages'];
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: reqHeaders,
-        body: JSON.stringify(reqBody),
-        signal: abortControllerRef.current.signal,
-      });
-
-      setRawResponseJson({
-        status: response.status,
-        statusText: response.statusText,
-        headers: Object.fromEntries(response.headers.entries()),
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        let errMsg = errText;
-        try {
-          const parsed = JSON.parse(errText) as { error?: string };
-          errMsg = parsed.error || errText;
-        } catch { }
-        throw new Error(errMsg || `Server responded with ${response.status}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No readable stream in response");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let assistantContent = "";
-      let assistantReasoning = "";
-      let reasoningDeltaOpen = false;
-      const toolInvocations: ToolInvocation[] = [];
-      let streamError = "";
-
-      // Create initial empty assistant message
-      setMessages((prev: Message[]) => [...prev, { id: assistantMessageId, role: "assistant", content: "", toolInvocations: [] }]);
-
-      // Merge tag-based reasoning (parsed out of the visible text, e.g. Ollama
-      // <think> blocks) with dedicated reasoning stream deltas (hosted reasoning
-      // models) so the accordion shows the complete thought process. Reasoning is
-      // never appended to the visible answer content.
-      const updateAssistant = () => {
-        const parsed = parseReasoning(assistantContent);
-        const reasoning = [parsed.reasoning, assistantReasoning].filter(Boolean).join("\n\n") || null;
-        const reasoningOpen = parsed.isOpen || reasoningDeltaOpen;
-        setMessages((prev: Message[]) =>
-          prev.map((m: Message) =>
-            m.id === assistantMessageId ? { ...m, content: parsed.cleanText, reasoning, reasoningOpen, statusLine: undefined } : m
-          )
-        );
-      };
-
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-
-        if (process.env.NODE_ENV === 'development') {
-          console.debug('[stream line]', line);
-        }
-
-        // Parse Vercel AI SDK stream format
-        const colonIndex = line.indexOf(":");
-        if (colonIndex === -1) return;
-
-        const type = line.slice(0, colonIndex);
-        const payloadStr = line.slice(colonIndex + 1);
-
-        try {
-          if (type === "3") {
-            streamError = payloadStr.replace(/^"|"$/g, '') || "Request failed";
-            console.error("[Chat] stream error:", streamError);
-            setMessages((prev: Message[]) =>
-              prev.map((m: Message) =>
-                m.id === assistantMessageId ? { ...m, error: streamError } : m
-              )
-            );
-            return;
-          }
-
-          const payload = JSON.parse(payloadStr);
-
-          if (type === "0") {
-            assistantContent += payload;
-            updateAssistant();
-          } else if (type === "9") {
-            const toolCall: ToolInvocation = {
-              toolCallId: payload.toolCallId,
-              toolName: payload.toolName,
-              args: payload.args,
-              state: "calling",
-            };
-            toolInvocations.push(toolCall);
-            const statusLine = assistantContent.trim().length === 0 ? `Using tool: ${payload.toolName}...` : undefined;
-            setMessages((prev: Message[]) =>
-              prev.map((m: Message) =>
-                m.id === assistantMessageId ? { ...m, toolInvocations: [...toolInvocations], ...(statusLine ? { statusLine } : {}) } : m
-              )
-            );
-          } else if (type === "data") {
-            if (payload.type === "text-delta") {
-              assistantContent += payload.delta || "";
-              updateAssistant();
-            } else if (payload.type === "reasoning-start") {
-              reasoningDeltaOpen = true;
-              // Reasoning is streaming before any visible text — surface the
-              // accordion with a live "Thinking…" placeholder via reasoningOpen.
-              updateAssistant();
-            } else if (payload.type === "reasoning-delta") {
-              // Reasoning deltas are appended ONLY to assistantReasoning, never to
-              // assistantContent, so thinking can't leak into the visible answer.
-              assistantReasoning += payload.delta || "";
-              updateAssistant();
-            } else if (payload.type === "reasoning-end") {
-              reasoningDeltaOpen = false;
-              updateAssistant();
-            } else if (payload.type === "error") {
-              streamError = payload.errorText || "An error occurred";
-              console.error("[Chat] stream error (data channel):", streamError, payload);
-              setMessages((prev: Message[]) =>
-                prev.map((m: Message) =>
-                  m.id === assistantMessageId ? { ...m, error: streamError } : m
-                )
-              );
-            } else if (payload.type === "tool-input-start" || payload.type === "tool-input-available" || payload.type === "tool-call") {
-              const statusLine = assistantContent.trim().length === 0 ? `Using tool: ${payload.toolName}...` : undefined;
-
-              if (payload.type === "tool-input-start") {
-                if (statusLine) {
-                  setMessages((prev: Message[]) => prev.map((m: Message) => m.id === assistantMessageId ? { ...m, statusLine } : m));
-                }
-              } else {
-                const toolCall: ToolInvocation = {
-                  toolCallId: payload.toolCallId,
-                  toolName: payload.toolName,
-                  args: payload.input || payload.args || {},
-                  state: "calling",
-                };
-                if (!toolInvocations.find(t => t.toolCallId === toolCall.toolCallId)) {
-                  toolInvocations.push(toolCall);
-                  setMessages((prev: Message[]) =>
-                    prev.map((m: Message) =>
-                      m.id === assistantMessageId ? { ...m, toolInvocations: [...toolInvocations], ...(statusLine ? { statusLine } : {}) } : m
-                    )
-                  );
-                } else if (statusLine) {
-                  // If we already have it in toolInvocations, just ensure statusLine is set if needed
-                  setMessages((prev: Message[]) => prev.map((m: Message) => m.id === assistantMessageId ? { ...m, statusLine } : m));
-                }
-              }
-            }
-          }
-        } catch { }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          processLine(line);
-        }
-      }
-
-      // Flush any trailing content left in buffer after the stream closes
-      if (buffer.trim()) {
-        processLine(buffer);
-      }
-
-      const endTime = Date.now();
-      const currentLatency = endTime - startTime;
-      setLatency(currentLatency);
-
-      // Estimate tokens
-      const promptText = userContent || "";
-      const responseText = assistantContent || "";
-      const estimatedPromptTokens = Math.round(promptText.length / 3.8);
-      const estimatedResponseTokens = Math.round(responseText.length / 3.8);
-      const totalTokens = estimatedPromptTokens + estimatedResponseTokens + estimatedToolsTokenCount;
-      setTokensCount(totalTokens);
-
-      setIsLoading(false);
-      const parsedFinal = parseReasoning(assistantContent);
-      // If a reasoning tag opened but never closed, it wasn't valid reasoning
-      // markup — surface the whole reply as the answer instead of hiding it
-      // behind the "Thought process" accordion.
-      const reasoningUnclosed = parsedFinal.isOpen;
-      const reasoningText = [parsedFinal.reasoning, assistantReasoning].filter(Boolean).join("\n\n") || null;
-      const finalAssistant: Message = {
-        id: assistantMessageId,
-        role: "assistant",
-        content: reasoningUnclosed ? stripOpenReasoningTag(assistantContent) : parsedFinal.cleanText,
-        reasoning: reasoningUnclosed ? null : reasoningText,
-        reasoningOpen: false,
-        toolInvocations,
-        ...(streamError ? { error: streamError } : {}),
-      };
-      const finalMessages: Message[] = [...updatedMessages, finalAssistant];
-      setMessages(finalMessages);
-      persistSession(finalMessages);
-
-      // Handle tool call resolution if tools are pending
-      if (toolInvocations.length > 0) {
-        await resolveToolCalls(assistantMessageId, toolInvocations, finalMessages, turnCount);
-      }
-    } catch (err: unknown) {
-      const error = err as { name?: string; message?: string };
-      if (error.name === "AbortError") {
-        console.log("Stream aborted");
-      } else {
-        setMessages((prev: Message[]) => {
-          const hasAssistant = prev.some((m: Message) => m.id === assistantMessageId);
-          if (hasAssistant) {
-            return prev.map((m: Message) => m.id === assistantMessageId ? { ...m, content: "", error: error.message } : m);
-          } else {
-            return [...prev, { id: `err-${Date.now()}`, role: "assistant", content: "", error: error.message }];
-          }
-        });
-      }
-      setIsLoading(false);
-    }
+      const records = new Map<string, Promise<AttachmentRecord>>();
+      requestMessages = await Promise.all(history.map(async m => ({ role: m.role, content: m.content, toolInvocations: m.toolInvocations,
+        ...(m.attachments?.length ? { attachments: await Promise.all(m.attachments.map(ref => {
+          if (!records.has(ref.id)) records.set(ref.id, loadAttachment(ref));
+          return records.get(ref.id)!;
+        })) } : {}),
+      })));
+    } catch { return rejectAttachment('An attachment is unavailable in local storage. Use Settings → Restore backup, or reattach the original file in a new chat. Nothing was sent to the provider; files were not omitted.'); }
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const body: ChatRequestBody = { provider, model, systemPrompt: current.settings.systemPrompt, ollamaUrl: current.settings.ollamaUrl,
+      messages: requestMessages, enabledTools };
+    const json = JSON.stringify(body);
+    if (new TextEncoder().encode(json).byteLength > MAX_REQUEST_BYTES) return rejectAttachment('This conversation exceeds the 4 MB request limit, including file data and history. Start a new chat or use smaller files. Nothing was truncated or sent to the provider.');
+    // Keep the inspector useful without retaining/rendering a second base64 copy.
+    setRawRequestJson({ ...body, messages: body.messages.map(m => ({ ...m,
+      ...(m.attachments ? { attachments: m.attachments.map(a => ({ ...a, data: `[Content redacted from inspector; ${a.size} bytes included in request]` })) } : {}) })) });
+    const response = await fetch('/api/chat', { method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json', 'x-chat-attempt-id': attemptId,
+        'x-openai-key': current.settings.openAiKey || '', 'x-anthropic-key': current.settings.anthropicKey || '',
+        'x-groq-key': current.settings.groqKey || '', 'x-custom-key': saved?.key || current.settings.customKey || '',
+        'x-custom-base-url': saved?.baseUrl || current.settings.customBaseUrl || '' }, body: json });
+    if (!signal.aborted) setRawResponseJson({ status: response.status });
+    return response;
   };
-
-  // Resolve tool calls in the browser, then continue chat
-  const resolveToolCalls = async (assistantMessageId: string, toolCalls: ToolInvocation[], currentMessagesList: Message[], turnCount = 0) => {
-    if (turnCount >= 10) {
-      console.warn("Tool call limit reached (10 turns). Stopping agent loop.");
-      return;
-    }
-
-    const resolvedInvocations = toolCalls.map(call => {
-      // Find the tool definition
-      const toolDef = rawRequestJson?.enabledTools?.find((t: ChatRequestTool) => t.name === call.toolName);
-      const schema = toolDef?.inputSchema || { type: "object", properties: {}, required: [] };
-
-      // 1. Resolve arguments
-      const resolvedArgs = resolveGithubToolArgs(
-        toolDef?.originalName || call.toolName,
-        call.args || {},
-        schema,
-        currentMessagesList
-      );
-
-      // 2. Validate
-      const validation = validateToolArgs(resolvedArgs, schema);
-
-      return {
-        ...call,
-        args: resolvedArgs,
-        validation,
-        serverId: call.serverId ?? toolDef?.serverId,
-        originalName: call.originalName ?? toolDef?.originalName,
-        state: validation.valid ? 'needs-approval' as const : 'result' as const,
-        result: validation.valid ? undefined : { error: `Missing required parameter(s): ${validation.missingFields.join(', ')}` },
-        turnCount
-      };
-    });
-
-    setMessages((prev: Message[]) => {
-      const next = prev.map((m: Message) =>
-        m.id === assistantMessageId ? { ...m, toolInvocations: resolvedInvocations, statusLine: undefined } : m
-      );
-      // Persist pending approval cards too — otherwise the first-message
-      // reload (persist -> setActiveSessionId -> loadActiveSession) wipes
-      // them and the UI flips to "No MCP tool was called".
-      persistSession(next);
-      return next;
-    });
-    // Log validation failures loudly: free-tier models (e.g. minimax-m3 via
-    // OpenRouter) often emit tool calls with missing args, which previously
-    // looked like "the card just disappeared".
-    resolvedInvocations.forEach((ti) => {
-      if (ti.state === 'result' && (ti.result as { error?: string } | undefined)?.error) {
-        console.error(`[MCP] tool "${ti.toolName}" rejected before execution:`, (ti.result as { error?: string }).error, { args: ti.args });
-      } else if (ti.state === 'needs-approval') {
-        console.log(`[MCP] tool "${ti.toolName}" awaiting approval`, { args: ti.args });
-      }
-    });
-    setIsLoading(false);
-  };
-
-  const executeToolCall = async (assistantMessageId: string, toolCallId: string, updatedArgs?: Record<string, unknown>) => {
-    const currentMessages = stateRef.current.messages;
-    const msg = currentMessages.find((m: Message) => m.id === assistantMessageId);
-    if (!msg) return;
-
-    const toolCall = msg.toolInvocations?.find((ti: ToolInvocation) => ti.toolCallId === toolCallId);
-    if (!toolCall) return;
-
-    const args = updatedArgs || toolCall.args;
-
-    setMessages((prev: Message[]) =>
-      prev.map((m: Message) => {
-        if (m.id === assistantMessageId) {
-          return {
-            ...m,
-            toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) =>
-              ti.toolCallId === toolCallId ? { ...ti, state: 'executing' as const, args } : ti
-            )
-          };
-        }
-        return m;
-      })
-    );
-
+  const stopGeneration = () => engine.stop();
+  const retryLastMessage = () => { setAttachmentError(''); void engine.retry(requestModel); };
+  const executeRestart = () => { setAttachmentError(''); void engine.restart(requestModel); };
+  const clearChat = () => { setConfirmModalAction('clear'); setShowConfirmModal(true); };
+  const executeClear = () => { setActiveSessionId(null); };
+  const retrySaving = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true; setIsSaving(true); setSaveFeedback(false);
     try {
-      const toolDef = rawRequestJson?.enabledTools?.find((t: ChatRequestTool) => t.name === toolCall.toolName);
-      const originalName = toolDef?.originalName || toolCall.toolName;
-      const serverId = toolDef?.serverId;
-
-      // Strict: the tool must run ONLY on its own connected server, no fallback
-      const activeServ = mcpServers.find((s: McpServer) => s.id === serverId && s.status === "connected");
-      if (!activeServ) throw new Error(`No active MCP server found for tool ${toolCall.toolName}.`);
-
-      const authHeaders: Record<string, string> =
-        activeServ.preset === "github" && settings.githubPat
-          ? { Authorization: `Bearer ${settings.githubPat}` }
-          : activeServ.headers || {};
-      const result = await callMcpTool(activeServ.url, authHeaders, originalName, args);
-
-      setMessages((prev: Message[]) => {
-        const newMessages = prev.map((m: Message) => {
-          if (m.id === assistantMessageId) {
-            const newInvocations = m.toolInvocations?.map((ti: ToolInvocation) => {
-              if (ti.toolCallId === toolCallId) {
-                return { ...ti, state: 'result' as const, result };
-              }
-              return ti;
-            });
-            return { ...m, toolInvocations: newInvocations };
-          }
-          return m;
-        });
-
-        // Check if all tools are resolved
-        const updatedMsg = newMessages.find(m => m.id === assistantMessageId);
-        const allResolved = updatedMsg?.toolInvocations?.every((ti: ToolInvocation) => ti.state === 'result') ?? false;
-
-        if (allResolved) {
-          setTimeout(() => {
-            sendMessage(null, newMessages, (toolCall.turnCount || 0) + 1);
-          }, 0);
-        }
-
-        return newMessages;
-      });
-    } catch (err: unknown) {
-      const rawMessage =
-        err instanceof Error && err.message
-          ? err.message
-          : typeof err === "string" && err
-            ? err
-            : "Unknown error";
-      // Never leave the confirmation card in a silent/broken state: always
-      // surface an explicit error result so the user sees what happened.
-      // console.error keeps it visible in Vercel logs too (previously zero logs).
-      console.error(`[MCP] executeToolCall failed for "${toolCall.toolName}":`, rawMessage, { args });
-      const displayMessage = rawMessage.startsWith("MCP tool call failed")
-        ? rawMessage
-        : `MCP tool call failed: ${rawMessage}`;
-      setMessages((prev: Message[]) => {
-        const next = prev.map((m: Message) => {
-          if (m.id === assistantMessageId) {
-            return {
-              ...m,
-              statusLine: undefined,
-              toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) =>
-                ti.toolCallId === toolCallId
-                  ? { ...ti, state: 'result' as const, result: { error: displayMessage } }
-                  : ti
-              )
-            };
-          }
-          return m;
-        });
-        persistSession(next);
-        return next;
-      });
+      // Both APIs may retain a safe error instead of rejecting. Success feedback
+      // below also checks their current dirty/error state, not just this await.
+      await engine.save(); await retryWorkspaceStorage();
+    } catch (error) { setStorageError({ ...chatError('storage'), code: storageErrorCode(error) }); }
+    finally { savingRef.current = false; setIsSaving(false); setSaveFeedback(true); }
+  };
+  const exportRecovery = async () => {
+    if (exportingRef.current) return;
+    exportingRef.current = true; setIsExporting(true); setExportError('');
+    let url: string | undefined;
+    try {
+      const sessions = engine.exportUnsaved();
+      if (!sessions.length) { setExportError('There are no unsaved chats to download. Local saving may already have completed.'); return; }
+      const data = await createRecoveryExport(sessions);
+      // Compact JSON stays within the same UTF-8 limit checked by recovery.
+      const file = new Blob([JSON.stringify(data)], { type: 'application/json' });
+      if (file.size > MAX_RECOVERY_BYTES) throw new RecoveryValidationError('RecoveryTooLarge');
+      url = URL.createObjectURL(file);
+      const link = document.createElement('a'); link.href = url; link.download = 'playground-chat-recovery.json';
+      link.click();
+    } catch (error) {
+      const detail = error instanceof RecoveryValidationError || error instanceof RecoveryStorageError
+        ? `${error.message} (${error.code})` : `Local data could not be read completely (${storageErrorCode(error)}).`;
+      setExportError(`${detail} No incomplete download was created. Keep this tab open and retry local saving. Recovery backups support up to 32 MiB.`);
+    } finally {
+      if (url) { const downloadUrl = url; setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000); }
+      exportingRef.current = false; setIsExporting(false);
     }
   };
-
-  const declineToolCall = (assistantMessageId: string, toolCallId: string) => {
-    setMessages((prev: Message[]) => {
-      const currentToolCall = prev
-        .find((m: Message) => m.id === assistantMessageId)
-        ?.toolInvocations?.find((ti: ToolInvocation) => ti.toolCallId === toolCallId);
-
-      // Ignore stale/double clicks. In particular, never overwrite a result
-      // that arrived while the approval card was still visible.
-      if (!currentToolCall || currentToolCall.state !== 'needs-approval') return prev;
-
-      const next = prev.map((m: Message) => m.id === assistantMessageId ? {
-        ...m,
-        statusLine: undefined,
-        toolInvocations: m.toolInvocations?.map((ti: ToolInvocation) =>
-          ti.toolCallId === toolCallId
-            ? { ...ti, state: 'result' as const, result: { error: 'User declined tool execution.' } }
-            : ti
-        )
-      } : m);
-
-      persistSession(next);
-
-      // A denial is a valid tool result. Once every parallel call has either
-      // completed or been denied, continue the model turn so the LLM can
-      // explain the cancellation or choose a different approach.
-      const updatedMessage = next.find((m: Message) => m.id === assistantMessageId);
-      const allResolved = updatedMessage?.toolInvocations?.every(
-        (ti: ToolInvocation) => ti.state === 'result'
-      ) ?? false;
-      if (allResolved) {
-        setTimeout(() => {
-          sendMessage(null, next, (currentToolCall.turnCount || 0) + 1);
-        }, 0);
-      }
-
-      return next;
-    });
+  const executeToolCall = (messageId: string, toolId: string) => engine.approve(messageId, toolId, async (call, signal) => {
+    const current = stateRef.current;
+    const server = current.mcpServers.find(s => s.id === call.serverId && s.status === 'connected');
+    if (!server) throw new Error('MCP server unavailable');
+    const headers = server.preset === 'github' && current.settings.githubPat ? { Authorization: `Bearer ${current.settings.githubPat}` } : server.headers || {};
+    return callMcpTool(server.url, headers, call.originalName || call.toolName, call.args, signal);
+  }, requestModel);
+  const declineToolCall = (messageId: string, toolId: string) => { void engine.decline(messageId, toolId, requestModel); };
+  const retryToolCall = (messageId: string, toolId: string) => engine.requestToolRetry(messageId, toolId,
+    call => canRetryTool(call, stateRef.current.mcpServers.find(s => s.id === call.serverId)));
+  const selectAttachments = async (files: File[]) => {
+    if (!files.length || readingAttachmentsRef.current) return;
+    if (draftAttachmentsRef.current.length + files.length > MAX_ATTACHMENTS) { setAttachmentError('Attach at most 4 files per message.'); return; }
+    readingAttachmentsRef.current = true; setReadingAttachments(true); setAttachmentError('');
+    try {
+      const records: AttachmentRecord[] = [];
+      for (const file of files) records.push(await readAttachment(file));
+      const next = [...draftAttachmentsRef.current, ...records];
+      validateAttachmentSelection(next, input);
+      updateDraftAttachments(next);
+    } catch (error) { setAttachmentError(error instanceof Error ? error.message : 'Files could not be read locally. Select them again.'); }
+    finally { readingAttachmentsRef.current = false; setReadingAttachments(false); }
   };
-
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
-    sendMessage(input);
+    if ((!input.trim() && !draftAttachments.length) || readingAttachmentsRef.current || !sessionReady || !settingsReady || engine.busy) return;
+    if (!selectedModel || !activeOptions.some(option => option.value === selectedModel)) { setShowProviderHint(true); return; }
+    try { validateAttachmentSelection(draftAttachments, input); }
+    catch (error) { setAttachmentError((error as Error).message); return; }
+    setShowProviderHint(false);
+    const sessionId = engine.ensureSession();
+    try { stageAttachments(sessionId, draftAttachments); }
+    catch { setAttachmentError('Files could not be prepared. Your draft is retained; select the files again.'); return; }
+    if (!engine.submit(input, requestModel, draftAttachments.map(attachmentRef))) return;
+    if (!activeSessionId) setActiveSessionId(sessionId);
+    setInput('');
+    updateDraftAttachments([]);
+    setAttachmentError('');
   };
-
-  const scrollToBottom = () => {
-    const needsApprovalCard = document.querySelector('[data-state="needs-approval"]');
-    if (needsApprovalCard) {
-      needsApprovalCard.scrollIntoView({ behavior: "smooth", block: "center" });
-    } else {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading]);
+  const storageStillPending = !!(storageError || settingsError || sessionError || settingsLoadFailed || unsavedCount || engine.hasUnsavedChanges || hasUnsavedSettings());
+  const storageBlocked = storageError?.code === 'StorageBlockedError' || settingsError?.includes('(StorageBlockedError)') || sessionError?.includes('(StorageBlockedError)');
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background text-foreground selection:bg-primary/20 font-sans">
@@ -965,6 +502,7 @@ function WorkspaceContent() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setIsSettingsOpen(true)}
+              aria-label="Settings"
               className="p-1.5 hover:bg-muted rounded-md text-muted-foreground hover:text-foreground transition-colors md:hidden cursor-pointer"
             >
               <Settings className="w-4 h-4" />
@@ -982,9 +520,10 @@ function WorkspaceContent() {
         </header>
 
         {/* Chat Area */}
-        <div className="flex-1 overflow-y-auto">
-          <div className="max-w-3xl mx-auto w-full px-4 py-8 space-y-6">
-            {messages.map((msg: Message) => (
+        <div className="relative flex-1 min-h-0">
+        <div ref={scrollViewport} tabIndex={0} aria-label="Chat history" className="h-full overflow-y-auto [overflow-anchor:none]">
+          <div ref={scrollContent} className="max-w-3xl mx-auto w-full px-4 py-8 space-y-6">
+            {messages.filter(m => !(m.execution?.status === 'complete' && !m.content && !m.reasoning && !m.toolInvocations?.length && !m.attachments?.length)).map((msg: Message) => (
               <div
                 key={msg.id}
                 className={`flex gap-4 w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}
@@ -1001,6 +540,9 @@ function WorkspaceContent() {
                     : "bg-muted/40 text-foreground rounded-tl-sm border border-border/50"
                     }${(msg.toolInvocations?.length ?? 0) > 0 ? " w-full" : ""}`}
                 >
+                  {!!msg.attachments?.length && <div aria-label="Message attachments" className="grid gap-2 mb-3">
+                    {msg.attachments.map(attachment => <AttachmentCard key={attachment.id} attachment={attachment} />)}
+                  </div>}
                   {(() => {
                     // Prefer the stored reasoning (set during streaming); fall
                     // back to parsing raw content for older persisted messages.
@@ -1018,7 +560,7 @@ function WorkspaceContent() {
                           />
                         )}
                         {parsed.cleanText && (
-                          <div className="whitespace-pre-wrap break-words">
+                          <div className={msg.role === 'assistant' ? 'min-w-0 break-words' : 'whitespace-pre-wrap break-words'}>
                             {msg.role === "assistant" ? (
                               <Markdown text={parsed.cleanText} />
                             ) : (
@@ -1038,24 +580,7 @@ function WorkspaceContent() {
                       <div className="whitespace-pre-wrap break-words">{msg.error}</div>
                     </div>
                   )}
-                  {msg.role === "assistant" && !msg.error && !msg.toolInvocations?.length && msg.id !== "welcome" && (
-                    (() => {
-                      const isLast = msg.id === messages[messages.length - 1]?.id;
-                      if (isLoading && isLast) return null;
-
-                      const hasActiveTools = mcpServers.some((s: McpServer) => s.status === 'connected' && (s.tools?.length ?? 0) > 0);
-
-                      if (hasActiveTools) {
-                        return (
-                          <div className="mt-2 inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-500 text-[10px] font-medium border border-amber-500/20 whitespace-nowrap">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                            No MCP tool was called.
-                          </div>
-                        );
-                      }
-                      return null;
-                    })()
-                  )}
+                  <ExecutionStatus message={msg} busy={isLoading || msg.id !== messages.at(-1)?.id} onRetry={retryLastMessage} />
                   {msg.toolInvocations && (() => {
                     const pendingTools = msg.toolInvocations!.filter((t: ToolInvocation) => t.state === 'needs-approval');
                     const firstPendingToolId = pendingTools.length > 0 ? pendingTools[0].toolCallId : null;
@@ -1068,79 +593,83 @@ function WorkspaceContent() {
                         isFirstPending={toolCall.toolCallId === firstPendingToolId}
                         executeToolCall={executeToolCall}
                         declineToolCall={declineToolCall}
+                        retryToolCall={retryToolCall}
+                        isLatest={msg.id === messages.at(-1)?.id}
                         setMessages={setMessages}
                       />
                     ));
                   })()}
 
-                  {/* Persistent Working Indicator */}
-                  {(() => {
-                    const isLast = msg.id === messages[messages.length - 1]?.id;
-                    const activeTool = msg.toolInvocations?.find((ti: ToolInvocation) => ti.state === 'executing');
-                    const isWorking = activeTool || (isLoading && isLast && msg.role === 'assistant');
 
-                    if (isWorking) {
-                      const workingText = activeTool ? `Using tool: ${activeTool.toolName}...` : msg.statusLine || 'Working...';
-                      return (
-                        <div className="flex items-center gap-2 text-muted-foreground text-[11px] font-medium mt-3 mb-1 animate-pulse">
-                          <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60" />
-                          {workingText}
-                        </div>
-                      );
-                    }
-                    return null;
-                  })()}
                 </div>
               </div>
             ))}
 
-            {isLoading && messages[messages.length - 1]?.role !== "assistant" && (
-              <div className="flex gap-4 w-full justify-start">
-                <div className="w-8 h-8 rounded-full bg-primary/5 border border-primary/10 flex items-center justify-center shrink-0 mt-0.5">
-                  <Bot className="w-4 h-4 text-primary" />
-                </div>
-                <div className="bg-muted/40 text-foreground border border-border/50 rounded-2xl rounded-tl-sm px-5 py-4 flex items-center gap-1.5 shadow-sm">
-                  <div className="w-1.5 h-1.5 rounded-full bg-foreground/40 animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-foreground/40 animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-foreground/40 animate-bounce" style={{ animationDelay: "300ms" }} />
-                </div>
+            {messages.length > 1 && !isLoading && (
+              <div role="toolbar" aria-label="Chat actions" aria-hidden={!scrollAtBottom} inert={!scrollAtBottom}
+                className={`flex flex-wrap items-center gap-2 pl-12 ${scrollAtBottom ? '' : 'invisible pointer-events-none'}`}>
+                <button type="button" onClick={retryLastMessage} disabled={!canContinueModel(messages.at(-1))} className={MODEL_ACTION_CLASS}>
+                  Retry model step
+                </button>
+                <button type="button" onClick={() => { setConfirmModalAction('restart'); setShowConfirmModal(true); }} className={MODEL_ACTION_CLASS}>
+                  Start turn again
+                </button>
+                <button type="button" onClick={clearChat}
+                  className="text-[10px] font-bold text-muted-foreground hover:text-destructive uppercase tracking-tight px-2 py-1 rounded bg-muted/30 hover:bg-destructive/10 transition-colors cursor-pointer">
+                  Clear Chat
+                </button>
               </div>
             )}
-            <div ref={messagesEndRef} />
           </div>
         </div>
-
+        {scrollAway && <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center px-4">
+          <button type="button" onClick={scrollLatest} className="pointer-events-auto px-4 py-2 rounded-full border border-border/70 bg-background/85 backdrop-blur-md shadow-sm text-xs cursor-pointer">Latest messages ↓{messages.some(m => m.toolInvocations?.some(t => t.state === 'needs-approval')) ? ' · Tool approval waiting' : ''}</button>
+        </div>}
+        </div>
+        {(storageError || settingsError || sessionError) && <div role="alert" aria-label="Local storage" className="mx-4 mt-2 p-3 border border-amber-500/30 bg-amber-500/5 rounded-xl text-xs text-foreground shrink-0">
+          {storageError && <p>Local saving is unavailable{storageError.code ? ` (${storageError.code})` : ''}. {unsavedCount} chat(s) are kept in this tab only. You can continue and switch chats. Save or download them before closing this tab.</p>}
+          {settingsError && <p className={storageError ? 'mt-1.5' : ''}>{settingsError}</p>}
+          {sessionError && <p className="mt-1.5">{sessionError}</p>}
+          <p className="mt-1.5 text-muted-foreground">Use the same address, port and browser profile. A read failure does not mean your data was deleted.</p>
+          {storageBlocked && <p className="mt-1.5">Close other tabs or windows using this address, then retry. Do not clear site data.</p>}
+          <div className="flex flex-wrap gap-2 mt-2">
+          <button type="button" disabled={isSaving} onClick={() => { void retrySaving(); }} className="border rounded-md px-3 py-1 disabled:opacity-50 cursor-pointer">{isSaving ? 'Saving…' : 'Retry saving'}</button>
+          {storageError && <button type="button" disabled={isExporting} onClick={() => { void exportRecovery(); }} className="border rounded-md px-3 py-1 cursor-pointer disabled:opacity-50">{isExporting ? 'Preparing backup…' : 'Download unsaved chats'}</button>}
+          <button type="button" onClick={() => setIsRestoreOpen(true)} className="border rounded-md px-3 py-1 cursor-pointer">Restore backup</button>
+          </div>
+        </div>}
+        {saveFeedback && <div role="status" className="mx-4 mt-2 flex items-start gap-2 text-xs text-muted-foreground shrink-0">
+          <p className="flex-1">{storageStillPending ? 'Retry finished. Some local data is still unsaved or could not be read. Keep this tab open; see the storage warning.' : isLoading ? 'Local saving recovered. The current response is still in progress.' : 'Pending chats and settings saved locally.'}</p>
+          <button type="button" aria-label="Dismiss saving feedback" onClick={() => setSaveFeedback(false)} className="p-0.5 rounded hover:bg-muted cursor-pointer"><X className="w-3.5 h-3.5" /></button>
+        </div>}
+        {exportError && <div role="alert" className="mx-4 mt-2 text-xs text-amber-700 dark:text-amber-400 shrink-0">{exportError}</div>}
+        {loadError && <div role="alert" className="mx-4 p-3 text-xs text-destructive">Session could not be loaded. Current data is retained.
+          <button type="button" onClick={() => setLoadVersion(v => v + 1)} className="block mt-2 border rounded-md px-3 py-1 cursor-pointer">Retry loading</button>
+        </div>}
         {/* Input Form */}
-        <div className="p-4 bg-gradient-to-t from-background via-background to-transparent pb-1.5 md:pb-2">
+        <div className="p-4 shrink-0 pb-1.5 md:pb-2">
           <form onSubmit={handleFormSubmit} className="max-w-3xl mx-auto w-full relative">
-            <div className="flex items-center gap-2 mb-2 px-1">
-              {messages.length > 1 && !isLoading && (
-                <>
-                  <button
-                    type="button"
-                    onClick={retryLastMessage}
-                    className="text-[10px] font-bold text-muted-foreground hover:text-foreground uppercase tracking-tight px-2 py-1 rounded bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer"
-                  >
-                    Retry Last
-                  </button>
-                  <button
-                    type="button"
-                    onClick={clearChat}
-                    className="text-[10px] font-bold text-muted-foreground hover:text-destructive uppercase tracking-tight px-2 py-1 rounded bg-muted/30 hover:bg-destructive/10 transition-colors cursor-pointer"
-                  >
-                    Clear Chat
-                  </button>
-                </>
-              )}
-            </div>
+            <input ref={fileInput} type="file" multiple accept={ATTACHMENT_ACCEPT} aria-label="Attach files" className="hidden"
+              onChange={event => { const files = Array.from(event.target.files || []); event.target.value = ''; void selectAttachments(files); }} />
+            {attachmentError && <div role="alert" className="text-xs border border-amber-500/30 bg-amber-500/5 rounded-xl px-3 py-2 mb-2">{attachmentError}</div>}
+            {hasImages && imageSupport !== 'supported' && <ImageSupportHint key={imageHintSelection} selection={imageHintSelection} support={imageSupport} />}
             {(() => {
               const latestMessage = messages[messages.length - 1];
               const hasPendingToolApproval = latestMessage?.role === 'assistant' &&
                 latestMessage.toolInvocations?.some((ti: ToolInvocation) => ti.state === 'needs-approval');
 
               return (
-                <div className="relative flex flex-col w-full bg-muted/30 border border-input focus-within:ring-1 focus-within:ring-primary/50 focus-within:border-primary/50 focus-within:bg-background shadow-sm rounded-2xl transition-all duration-200">
+                <div role="group" aria-label="Message composer" className="relative flex flex-col w-full bg-muted/30 border border-input focus-within:ring-1 focus-within:ring-primary/50 focus-within:border-primary/50 focus-within:bg-background shadow-sm rounded-2xl transition-all duration-200">
+                  {!!draftAttachments.length && <div className="px-3 pt-3">
+                    <ul aria-label="Draft attachments" className="grid w-full max-w-[26rem] gap-2" style={{ gridTemplateColumns: `repeat(${MAX_ATTACHMENTS}, minmax(0, 1fr))` }}>
+                      {draftAttachments.map(record => <li key={record.id} className="min-w-0">
+                        <AttachmentCard attachment={record} record={record} variant="draft"
+                          onRemove={readingAttachments ? undefined : () => { updateDraftAttachments(draftAttachments.filter(file => file.id !== record.id)); setAttachmentError(''); }} />
+                      </li>)}
+                    </ul>
+                  </div>}
                   <textarea
+                    aria-label="Message"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     disabled={hasPendingToolApproval}
@@ -1151,11 +680,21 @@ function WorkspaceContent() {
                       }
                     }}
                     placeholder={hasPendingToolApproval ? "Waiting for tool approval..." : "Ask anything..."}
-                    className={`w-full bg-transparent px-4 pt-4 pb-12 min-h-[120px] max-h-[400px] resize-none focus:outline-none text-[15px] leading-relaxed placeholder:text-muted-foreground ${hasPendingToolApproval ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    className={`w-full bg-transparent px-4 pb-12 max-h-[400px] resize-none focus:outline-none text-[15px] leading-relaxed placeholder:text-muted-foreground ${draftAttachments.length ? 'min-h-[96px] pt-3' : 'min-h-[120px] pt-4'} ${hasPendingToolApproval ? 'opacity-50 cursor-not-allowed' : ''}`}
                   />
 
+                  <div className="absolute left-3 bottom-3 flex items-center gap-2">
+                    <AttachmentControls onChoose={() => fileInput.current?.click()}
+                      disabled={readingAttachments || isLoading || !!hasPendingToolApproval || draftAttachments.length >= MAX_ATTACHMENTS} />
+                    {readingAttachments && <span role="status" className="text-[10px] text-muted-foreground">Reading locally…</span>}
+                    {!!draftAttachments.length && !readingAttachments && <span aria-label="Attachment count" aria-live="polite" aria-atomic="true" className="text-[10px] tabular-nums text-muted-foreground">{draftAttachments.length}/{MAX_ATTACHMENTS}<span className="sr-only"> files attached</span></span>}
+                  </div>
                   <div className="absolute right-3 bottom-3 flex items-center gap-2">
-                    {isLoading ? (
+                    {!isLoading && providerUnavailable && settingsReady && showProviderHint && <div id="provider-hint" role="status" className="absolute right-0 bottom-full mb-3 w-64 max-w-[75vw] rounded-xl border border-border/70 bg-muted/85 backdrop-blur-md px-3.5 py-3 text-xs text-foreground shadow-lg">
+                      <p className="font-medium">Choose a provider to send a message.</p>
+                      <button type="button" onClick={() => activeOptions.length ? setIsModelDropdownOpen(true) : setIsSettingsOpen(true)} className="mt-2 font-semibold underline underline-offset-4 cursor-pointer">{activeOptions.length ? 'Choose provider' : 'Configure provider'}</button>
+                    </div>}
+                    {isLoading || hasPendingToolApproval ? (
                       <button
                         type="button"
                         onClick={stopGeneration}
@@ -1167,8 +706,13 @@ function WorkspaceContent() {
                     ) : (
                       <button
                         type="submit"
-                        disabled={!input.trim() || hasPendingToolApproval}
-                        className={`p-2 rounded-full flex items-center justify-center transition-all cursor-pointer ${input.trim() && !hasPendingToolApproval
+                        aria-label="Send message"
+                        aria-describedby={providerUnavailable && showProviderHint ? 'provider-hint' : undefined}
+                        aria-disabled={providerUnavailable}
+                        onMouseEnter={() => { if (providerUnavailable && (input.trim() || draftAttachments.length)) setShowProviderHint(true); }}
+                        onFocus={() => { if (providerUnavailable && (input.trim() || draftAttachments.length)) setShowProviderHint(true); }}
+                        disabled={(!input.trim() && !draftAttachments.length) || readingAttachments || hasPendingToolApproval || !sessionReady || !settingsReady}
+                        className={`p-2 rounded-full flex items-center justify-center transition-all cursor-pointer ${(input.trim() || draftAttachments.length) && !hasPendingToolApproval && !readingAttachments
                           ? "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
                           : "bg-muted-foreground/20 text-muted-foreground cursor-not-allowed"
                           }`}
@@ -1214,7 +758,8 @@ function WorkspaceContent() {
       <RightPanel />
 
       {/* Settings Modal Dialog */}
-      <SettingsModal />
+      <SettingsModal onRestoreBackup={() => setIsRestoreOpen(true)} />
+      {isRestoreOpen && <RestoreBackupDialog onClose={() => setIsRestoreOpen(false)} />}
 
       {/* Left Sidebar Overlay */}
       {isLeftSidebarOpen && (
@@ -1237,12 +782,12 @@ function WorkspaceContent() {
         <div className="fixed inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-background border border-border rounded-2xl w-full max-w-sm shadow-lg p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
             <h3 className="text-sm font-semibold text-foreground">
-              {confirmModalAction === "clear" ? "Clear Chat History?" : "Retry Last Message?"}
+              {confirmModalAction === "clear" ? "Start a New Chat?" : "Start This Turn Again?"}
             </h3>
             <p className="text-xs text-muted-foreground leading-relaxed">
               {confirmModalAction === "clear"
-                ? "Are you sure you want to clear all messages in this session? This action cannot be undone."
-                : "Are you sure you want to re-send your last message? This will delete the last assistant response and generate a new one."}
+                ? "Are you sure you want to clear all messages in this session? The saved session remains in the sidebar."
+                : "Repeat the last user request as a new turn. History and tool results stay saved. Previously completed remote actions and provider costs may repeat. Verify any unknown tool outcome first; those turns and active Retry-After waits cannot be restarted."}
             </p>
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -1260,8 +805,8 @@ function WorkspaceContent() {
                 onClick={() => {
                   if (confirmModalAction === "clear") {
                     executeClear();
-                  } else if (confirmModalAction === "retry") {
-                    executeRetry();
+                  } else if (confirmModalAction === "restart") {
+                    executeRestart();
                   }
                   setShowConfirmModal(false);
                   setConfirmModalAction(null);
@@ -1281,12 +826,50 @@ function WorkspaceContent() {
   );
 }
 
+// Keys and URL credentials/query parameters never participate in hint identity.
+function imageHintIdentity(provider: string, model: string, baseUrl?: string) {
+  let endpoint = '';
+  if (baseUrl) {
+    try { const url = new URL(baseUrl); endpoint = `${url.origin}${url.pathname.replace(/\/$/, '')}`; }
+    catch { endpoint = 'unconfigured'; }
+  }
+  return JSON.stringify([provider, endpoint, model]);
+}
+
+const dismissedImageHints = new Set<string>();
+function ImageSupportHint({ selection, support }: { selection: string; support: 'unknown' | 'unsupported' }) {
+  const [visible, setVisible] = useState(false);
+  const storageKey = `ai-workspace:image-hint:v1:${selection}`;
+  useEffect(() => {
+    let stale = false;
+    void Promise.resolve().then(() => {
+      let dismissed = dismissedImageHints.has(selection);
+      try { dismissed ||= localStorage.getItem(storageKey) === '1'; }
+      catch { /* An unavailable preference store must never gate image requests. */ }
+      if (!stale) setVisible(!dismissed);
+    });
+    return () => { stale = true; };
+  }, [selection, storageKey]);
+  if (!visible) return null;
+  return <div aria-label="Image support hint" className="mb-2 flex items-start gap-2 rounded-xl border border-border/40 bg-muted/25 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground backdrop-blur-sm">
+    <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-70" aria-hidden="true" />
+    <p className="min-w-0 flex-1">{support === 'unsupported' ? 'This model is listed as text-only.' : 'Image support is unverified.'} The provider decides; files stay intact. Charges may apply.</p>
+    <button type="button" aria-label="Dismiss image support hint" onClick={() => {
+      dismissedImageHints.add(selection);
+      try { localStorage.setItem(storageKey, '1'); } catch { /* Tab-memory fallback is enough when storage is blocked. */ }
+      setVisible(false);
+    }} className="-m-0.5 shrink-0 rounded-md p-1.5 hover:bg-muted/60 hover:text-foreground cursor-pointer"><X className="h-3.5 w-3.5" /></button>
+  </div>;
+}
+
 type ToolCallCardProps = {
   toolCall: ToolInvocation;
   msgId: string;
   isFirstPending: boolean;
   executeToolCall: (assistantMessageId: string, toolCallId: string, updatedArgs?: Record<string, unknown>) => void;
   declineToolCall: (assistantMessageId: string, toolCallId: string) => void;
+  retryToolCall: (assistantMessageId: string, toolCallId: string) => void;
+  isLatest: boolean;
   setMessages: (messages: Message[] | ((prev: Message[]) => Message[])) => void;
 };
 
@@ -1344,7 +927,7 @@ function getServerShortLabel(server: McpServer | undefined, toolName: string): s
   return null;
 }
 
-function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, declineToolCall }: ToolCallCardProps) {
+function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, declineToolCall, retryToolCall, isLatest }: ToolCallCardProps) {
   const [manuallyExpanded, setManuallyExpanded] = useState(false);
   const { mcpServers } = useWorkspace();
 
@@ -1366,9 +949,11 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, declin
   let statusText = 'Unknown';
   let statusColor = 'text-muted-foreground';
   if (isQueued) { statusText = 'Queued'; statusColor = 'text-muted-foreground'; }
+  else if (toolCall.state === 'calling') { statusText = 'Preparing tool…'; statusColor = 'text-muted-foreground'; }
   else if (isActiveApproval) { statusText = 'Waiting'; statusColor = 'text-primary animate-pulse'; }
   else if (isExecuting) { statusText = 'Executing...'; statusColor = 'text-primary animate-pulse'; }
-  else if (isResult && result?.error === 'User declined tool execution.') { statusText = 'Declined'; statusColor = 'text-muted-foreground'; }
+  else if (toolCall.outcome === 'unknown') { statusText = 'Outcome unknown — verify remotely'; statusColor = 'text-destructive'; }
+  else if (toolCall.outcome === 'declined' || (isResult && result?.error === 'User declined tool execution.')) { statusText = 'Declined'; statusColor = 'text-muted-foreground'; }
   else if (isResult && hasError) { statusText = 'Error'; statusColor = 'text-destructive'; }
   else if (isResult) { statusText = 'Success'; statusColor = 'text-emerald-500'; }
 
@@ -1446,6 +1031,7 @@ function ToolCallCard({ toolCall, msgId, isFirstPending, executeToolCall, declin
       )}
 
       {/* Action Buttons for Active Approval: 75% Confirm (black) / 25% Deny (1px light border) */}
+      {isLatest && canRetryTool(toolCall, owningServer) && <button type="button" onClick={() => retryToolCall(msgId, toolCall.toolCallId)} className="m-2 px-3 py-1 rounded-md border cursor-pointer">Retry read tool — new approval required</button>}
       {isActiveApproval && (
         <div className="flex gap-2 px-2.5 pb-2.5 pt-2 border-t border-border/20 mt-1">
           <button

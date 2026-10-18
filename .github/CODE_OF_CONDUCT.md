@@ -59,8 +59,9 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-[INSERT CONTACT EMAIL]. All complaints will be reviewed and investigated
+reported privately to the project maintainers through the contact options on
+[their GitHub profile](https://github.com/ownyourwebsite). Do not post personal
+details in public issues. All complaints will be reviewed and investigated
 promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

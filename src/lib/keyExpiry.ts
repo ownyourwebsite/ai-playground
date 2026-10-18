@@ -69,3 +69,12 @@ export function refreshKeyExpirations(settings: AppSettings, fields: SecretKeyFi
 
   return { ...updated, keyExpirations: expirations };
 }
+
+/** Keep provider definitions even when the user does not remember secrets. */
+export function settingsForStorage(settings: AppSettings): AppSettings {
+  if (settings.rememberKeys) return settings;
+  const persisted = { ...settings, keyExpirations: undefined,
+    savedProviders: settings.savedProviders?.map(provider => ({ ...provider, key: '' })) };
+  for (const field of KEY_FIELDS) persisted[field] = undefined;
+  return persisted;
+}

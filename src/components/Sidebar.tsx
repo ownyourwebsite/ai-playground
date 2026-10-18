@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useWorkspace } from "@/context/WorkspaceContext";
-import { deleteSession, getSkills, saveSkill, deleteSkill } from "@/lib/db";
+import { getSkills, saveSkill, deleteSkill } from "@/lib/db";
 import { Skill, Session } from "@/lib/types";
 
 // Lucide icon components available for skills (keyed by skill.icon)
@@ -77,6 +77,9 @@ export default function Sidebar() {
     activeSessionId,
     setActiveSessionId,
     startNewSession,
+    removeSession,
+    sessionError,
+    retryWorkspaceStorage,
     setIsSettingsOpen,
     setInput,
   } = useWorkspace();
@@ -85,6 +88,7 @@ export default function Sidebar() {
 
   // --- Skills state (local-first, stored in IndexedDB) ---
   const [skills, setSkills] = React.useState<Skill[]>([]);
+  const [skillsLoadError, setSkillsLoadError] = React.useState(false);
   const [activeSkillId, setActiveSkillId] = React.useState<string | null>(null);
   const [skillInstructions, setSkillInstructions] = React.useState("");
   const [skillUseMcp, setSkillUseMcp] = React.useState(false);
@@ -106,18 +110,13 @@ export default function Sidebar() {
         await Promise.all(DEFAULT_SKILLS.map((s) => saveSkill(s)));
         setSkills(DEFAULT_SKILLS);
       }
-    })();
+    })().catch(() => { setSkills(DEFAULT_SKILLS); setSkillsLoadError(true); });
   }, []);
 
   const handleDeleteSession = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     if (confirm("Are you sure you want to delete this session?")) {
-      await deleteSession(id);
-      if (activeSessionId === id) {
-        startNewSession();
-      }
-      // Force reload page / state if needed, or handle in context
-      window.location.reload();
+      await removeSession(id);
     }
   };
 
@@ -229,6 +228,8 @@ export default function Sidebar() {
               </button>
             )}
           </div>
+          {sessionError && <div role="alert" className="text-xs p-2 text-destructive"><p>{sessionError}</p><button type="button" onClick={() => { void retryWorkspaceStorage(); }} className="mt-1 underline cursor-pointer">Retry loading</button></div>}
+          {skillsLoadError && <p role="status" className="text-xs p-2 text-muted-foreground">Saved skills are unavailable. Built-in skills are shown temporarily.</p>}
           {sortedSessions.length === 0 ? (
             <div className="text-xs text-muted-foreground px-3 py-2 italic">
               No sessions yet

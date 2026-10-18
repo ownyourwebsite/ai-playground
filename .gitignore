@@ -12,6 +12,9 @@
 
 # testing
 /coverage
+/test-results/
+/playwright-report/
+/.cache/
 
 # next.js
 /.next/
@@ -40,3 +43,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local editor settings and generated agent instructions
+/.roo/
+/AGENTS.md
+
+# Internal working notes are not part of the public distribution
+/TEMP_*.md
+/CHAT_EXECUTION_UX_PLAN.md
+/PRODUCTION_READINESS_AUDIT.md
