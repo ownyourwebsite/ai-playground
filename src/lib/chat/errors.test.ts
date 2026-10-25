@@ -89,3 +89,26 @@ test('provider errors: wire decoder rebuilds allow-listed messages, not raw body
     assert.deepEqual(decoded, chatError(category));
   }
 });
+
+test('provider errors: OpenAI organization verification gets its own actionable message', () => {
+  const error = new APICallError({
+    message: 'Your organization must be verified to stream this model. Please go to: https://platform.openai.com/settings/organization/general',
+    url: 'https://api.openai.com/v1/responses', requestBodyValues: { input: secret }, statusCode: 400, isRetryable: false,
+  });
+  const classified = classifyError(error);
+  assert.deepEqual(classified, chatError('org-verification'));
+  assert.ok(classified.message.includes('platform.openai.com/settings/organization/general'));
+  assert.ok(!JSON.stringify(classified).includes(secret));
+  assert.equal(classifyError({ statusCode: 400, message: 'Unknown parameter: reasoning.summary' }).category, 'provider');
+});
+
+test('provider errors: SSRF blocks at connect time map to private-network, even when wrapped', async () => {
+  const { SsrfBlockedError } = await import('../ssrf');
+  const blocked = new SsrfBlockedError(`Blocked private address for ${secret}`);
+  for (const error of [blocked, new TypeError('fetch failed', { cause: blocked }), { cause: { cause: { code: 'EBLOCKED' } } }]) {
+    const classified = classifyError(error);
+    assert.deepEqual(classified, chatError('private-network'));
+    assert.ok(!classified.message.includes(secret));
+  }
+  assert.equal(classifyError({ code: 'ECONNREFUSED' }).category, 'provider');
+});

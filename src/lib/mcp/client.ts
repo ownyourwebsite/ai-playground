@@ -18,8 +18,15 @@ export const MCP_PROTOCOL_VERSION = "2026-07-28";
 /** Protocol version used only for the legacy `initialize` fallback path. */
 const LEGACY_PROTOCOL_VERSION = "2025-11-25";
 
-/** Frontend timeout for a single MCP round-trip (upstream proxy is 15s). */
+/**
+ * Frontend timeout for a single MCP round-trip. Must exceed the proxy's
+ * upstream timeout (15s, 60s for tools/call) so the proxy reports first.
+ */
 const FRONTEND_TIMEOUT_MS = 25000;
+const FRONTEND_TOOL_CALL_TIMEOUT_MS = 65000;
+
+/** Cap on tools/list pages followed via nextCursor. */
+const MAX_TOOL_PAGES = 20;
 
 /** HTTP header carrying the per-request protocol version. */
 const PROTOCOL_VERSION_HEADER = "mcp-protocol-version";
@@ -71,10 +78,19 @@ const transportModes = new Map<string, "stateless" | "legacy">();
 // URLs for which the legacy initialize handshake already succeeded.
 const legacyInitialized = new Set<string>();
 
+// protocolVersion the server answered with on initialize, keyed by server URL.
+const negotiatedVersions = new Map<string, string>();
+
 export function clearMcpSession(url: string): void {
   sessionIds.delete(url);
   transportModes.delete(url);
   legacyInitialized.delete(url);
+  negotiatedVersions.delete(url);
+}
+
+/** Version for legacy requests: what the server negotiated, else our offer. */
+function legacyVersionFor(url: string): string {
+  return negotiatedVersions.get(url) ?? LEGACY_PROTOCOL_VERSION;
 }
 
 function getHeaderCaseInsensitive(
@@ -112,49 +128,25 @@ function withProtocolMeta(
 }
 
 /**
- * True when an upstream error means "try the other transport".
- * Used in both directions:
- * - stateless -> legacy (server demands initialize/session)
- * - legacy -> stateless (server dropped initialize, method unknown)
- * The 2026-07-28 spec moves errors to bare HTTP statuses, so match on
- * `http 400`-style markers too — not only JSON-RPC substrings — because the
- * proxy forwards the upstream status code inside the thrown message.
+ * True when a failed `initialize` means "this server is stateless, try the
+ * 2026-07-28 transport". Deliberately narrow: only signals that the server
+ * does not know `initialize` / the offered protocol version qualify.
+ * - JSON-RPC -32601 / "method not found"
+ * - bare HTTP 404 / 501 (endpoint or method unsupported)
+ * - HTTP 400 whose detail names the protocol version or initialize/method
+ * Auth (401/403), rate limits, 5xx, timeouts, network errors, bad-argument
+ * errors and session errors must surface as-is; retrying them against another
+ * transport only hides the real failure. The proxy puts the upstream status
+ * in the thrown message ("Proxy error <status> ...").
  */
-function isLegacyFallbackError(message: string): boolean {
+function isStatelessFallbackError(message: string): boolean {
   const m = message.toLowerCase();
   return (
     m.includes("method not found") ||
     m.includes("-32601") ||
-    m.includes("unknown method") ||
-    m.includes("unsupported method") ||
-    m.includes("invalid request") ||
-    m.includes("-32600") ||
-    m.includes("protocol version") ||
-    m.includes("protocolversion") ||
-    m.includes("initialize") ||
-    m.includes("notifications/initialized") ||
-    m.includes("not initialized") ||
-    m.includes("missing session") ||
-    m.includes("invalid session") ||
-    m.includes("session") ||
-    m.includes("mcp-session-id") ||
-    m.includes("http 400") ||
-    m.includes("http 404") ||
-    m.includes("http 501") ||
-    m.includes("proxy error 400") ||
-    m.includes("proxy error 404") ||
-    m.includes("proxy error 501") ||
-    m.includes("upstream 400") ||
-    m.includes("upstream 404") ||
-    m.includes("upstream 501") ||
-    m.includes("status 400") ||
-    m.includes("status 404") ||
-    m.includes("status 501") ||
-    m.includes(" 400 ") ||
-    m.includes(" 404 ") ||
-    m.includes(" 501 ") ||
-    m.includes("406") ||
-    m.includes("505")
+    /^proxy error (404|501)\b/.test(m) ||
+    (/^proxy error 400\b/.test(m) &&
+      /protocol ?version|initialize|unknown method|unsupported method/.test(m))
   );
 }
 
@@ -199,8 +191,10 @@ async function rawSendMcpRequest(
           );
   }
 
+  const timeoutMs =
+    method === "tools/call" ? FRONTEND_TOOL_CALL_TIMEOUT_MS : FRONTEND_TIMEOUT_MS;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FRONTEND_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     let response: Response;
@@ -221,7 +215,7 @@ async function rawSendMcpRequest(
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw new Error(
-          `MCP request timed out after ${FRONTEND_TIMEOUT_MS}ms (${method})`
+          `MCP request timed out after ${timeoutMs}ms (${method})`
         );
       }
       throw err instanceof Error
@@ -282,7 +276,7 @@ async function notifyInitialized(
 ): Promise<void> {
   await rawSendMcpRequest(url, authHeaders, "notifications/initialized", undefined, {
     withSession: true,
-    protocolVersion: LEGACY_PROTOCOL_VERSION,
+    protocolVersion: legacyVersionFor(url),
     signal,
   });
 }
@@ -306,6 +300,14 @@ async function legacyInitialize(
     },
     { withSession: true, protocolVersion: LEGACY_PROTOCOL_VERSION, signal }
   );
+
+  // Later requests use the version the server negotiated (it may be older
+  // than our offer). Ignore anything that is not a date-style version.
+  const negotiated = (result as { protocolVersion?: unknown } | null | undefined)
+    ?.protocolVersion;
+  if (typeof negotiated === "string" && /^\d{4}-\d{2}-\d{2}$/.test(negotiated)) {
+    negotiatedVersions.set(url, negotiated);
+  }
 
   // Per the pre-2026 spec, the client MUST send notifications/initialized
   // after a successful initialize. A failure here must not break the connection.
@@ -368,14 +370,15 @@ export async function sendMcpRequest(
     signal?.throwIfAborted();
     const legacy = transportModes.get(url) !== 'stateless';
     return rawSendMcpRequest(url, authHeaders, method, params, {
-      withSession: legacy, protocolVersion: legacy ? LEGACY_PROTOCOL_VERSION : MCP_PROTOCOL_VERSION, signal,
+      withSession: legacy, protocolVersion: legacy ? legacyVersionFor(url) : MCP_PROTOCOL_VERSION, signal,
     });
   }
   // Legacy handshake methods always go direct (no fallback loop).
   if (method === "initialize" || method.startsWith("notifications/")) {
     return rawSendMcpRequest(url, authHeaders, method, params, {
       withSession: true,
-      protocolVersion: LEGACY_PROTOCOL_VERSION,
+      protocolVersion:
+        method === "initialize" ? LEGACY_PROTOCOL_VERSION : legacyVersionFor(url),
     });
   }
 
@@ -384,7 +387,7 @@ export async function sendMcpRequest(
     await ensureLegacyInitialized(url, authHeaders, signal);
     return rawSendMcpRequest(url, authHeaders, method, params, {
       withSession: true,
-      protocolVersion: LEGACY_PROTOCOL_VERSION,
+      protocolVersion: legacyVersionFor(url),
     });
   }
   if (cached === "stateless") {
@@ -394,28 +397,24 @@ export async function sendMcpRequest(
   }
 
   // Default: legacy-first (proven path for GitHub + most third-party servers).
-  // Only when the server explicitly rejects `initialize` as unknown (-32601 /
-  // method-not-found / 404 / 501) do we fall through to the stateless probe.
+  // Only a rejected `initialize` (see isStatelessFallbackError) falls through
+  // to the stateless probe. Once initialize has succeeded the server is
+  // legacy, so errors from the request itself surface as-is, never replayed.
   try {
     await ensureLegacyInitialized(url, authHeaders, signal);
-    const result = await rawSendMcpRequest(url, authHeaders, method, params, {
-      withSession: true,
-      protocolVersion: LEGACY_PROTOCOL_VERSION,
-    });
-    transportModes.set(url, "legacy");
-    return result;
   } catch (legacyErr) {
+    signal?.throwIfAborted();
     const legacyMessage =
       legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
-    // Auth / network / timeout / tool-argument errors must surface as-is —
-    // only "initialize is unknown" signals trigger the stateless fallback.
-    if (!isLegacyFallbackError(legacyMessage)) {
+    // Auth / network / timeout errors must surface as-is.
+    if (!isStatelessFallbackError(legacyMessage)) {
       throw legacyErr;
     }
 
     try {
       const retry = await rawSendMcpRequest(url, authHeaders, method, params, {
         withSession: false,
+        signal,
       });
       transportModes.set(url, "stateless");
       return retry;
@@ -431,14 +430,21 @@ export async function sendMcpRequest(
       throw legacyErr;
     }
   }
+
+  transportModes.set(url, "legacy");
+  return rawSendMcpRequest(url, authHeaders, method, params, {
+    withSession: true,
+    protocolVersion: legacyVersionFor(url),
+    signal,
+  });
 }
 
 /**
  * Connect entry-point. Legacy-first: tries the proven `initialize` handshake
  * (the path that worked with GitHub + DeepSeek before the migration), and
  * only when the server explicitly rejects `initialize` as unknown (-32601 /
- * method-not-found / 404 / 501) falls through to the stateless 2026-07-28
- * probe. The transport decision is cached per-URL.
+ * method-not-found / 404 / 501 / 400 naming the protocol version) falls
+ * through to the stateless 2026-07-28 probe. The transport decision is cached per-URL.
  */
 export async function initializeMcp(
   url: string,
@@ -465,7 +471,7 @@ export async function initializeMcp(
     const message =
       legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
     // Auth / network errors must fail fast — do not mask them with stateless.
-    if (!isLegacyFallbackError(message)) {
+    if (!isStatelessFallbackError(message)) {
       throw legacyErr;
     }
     // Server rejected initialize itself -> try stateless tools/list probe.
@@ -495,10 +501,24 @@ export async function listMcpTools(
   authHeaders?: Record<string, string>
 ): Promise<McpTool[]> {
   try {
-    const result = (await sendMcpRequest(url, authHeaders, "tools/list", {})) as {
-      tools?: McpTool[];
-    } | null;
-    return result?.tools || [];
+    // Follow nextCursor (capped, loop-safe); first occurrence of a name wins.
+    const tools = new Map<string, McpTool>();
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const result = (await sendMcpRequest(
+        url,
+        authHeaders,
+        "tools/list",
+        cursor === undefined ? {} : { cursor }
+      )) as { tools?: McpTool[]; nextCursor?: unknown } | null;
+      for (const tool of result?.tools ?? []) {
+        if (!tools.has(tool.name)) tools.set(tool.name, tool);
+      }
+      const next = result?.nextCursor;
+      if (typeof next !== "string" || !next || next === cursor) break;
+      cursor = next;
+    }
+    return [...tools.values()];
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(

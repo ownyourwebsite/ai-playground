@@ -4,6 +4,8 @@ import React, { useRef, useState } from "react";
 import { Sliders, X, Check, ChevronDown, Trash2, Plus, Monitor, Sun, Moon } from "lucide-react";
 import { useWorkspace, WorkspaceTheme } from "@/context/WorkspaceContext";
 import { AppSettings, SavedProvider } from "@/lib/types";
+import { DEFAULT_MODELS } from "@/lib/providers";
+import { fetchModelList, type ModelProvider } from "@/lib/models/client";
 
 export default function SettingsModal({ onRestoreBackup }: { onRestoreBackup: () => void }) {
   const { isSettingsOpen, setIsSettingsOpen, settingsReady } = useWorkspace();
@@ -37,17 +39,26 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
   const [isSavedProvidersOpen, setIsSavedProvidersOpen] = useState(false);
 
   const [openAiKey, setOpenAiKey] = useState(settings.openAiKey || "");
-  const [openAiModel, setOpenAiModel] = useState(settings.openAiModel || "gpt-5.6-luna");
+  const [openAiModel, setOpenAiModel] = useState(settings.openAiModel || DEFAULT_MODELS.openai);
   const [anthropicKey, setAnthropicKey] = useState(settings.anthropicKey || "");
-  const [anthropicModel, setAnthropicModel] = useState(settings.anthropicModel || "claude-sonnet-5");
+  const [anthropicModel, setAnthropicModel] = useState(settings.anthropicModel || DEFAULT_MODELS.anthropic);
   const [groqKey, setGroqKey] = useState(settings.groqKey || "");
-  const [groqModel, setGroqModel] = useState(settings.groqModel || "qwen/qwen3.6-27b");
+  const [groqModel, setGroqModel] = useState(settings.groqModel || DEFAULT_MODELS.groq);
   const [ollamaUrl, setOllamaUrl] = useState(settings.ollamaUrl || "http://127.0.0.1:11434/api");
-  const [ollamaModel, setOllamaModel] = useState(settings.ollamaModel || "llama3");
+  const [ollamaModel, setOllamaModel] = useState(settings.ollamaModel || DEFAULT_MODELS.ollama);
   const [githubWriteMode, setGithubWriteMode] = useState(settings.githubWriteMode !== false);
   const [rememberKeys, setRememberKeys] = useState(settings.rememberKeys || false);
 
   const [isPopularOpen, setIsPopularOpen] = useState(false);
+  // Live model ids from the provider (via /api/models), offered as plain
+  // <datalist> suggestions on the existing inputs. Failures stay silent: the
+  // field still accepts any id, and a stale one fails with "model not found".
+  const [modelSuggestions, setModelSuggestions] = useState<Partial<Record<ModelProvider, string[]>>>({});
+  const suggestModels = (provider: ModelProvider) => {
+    void fetchModelList(provider, { openAiKey, anthropicKey, groqKey, ollamaUrl, customKey, customBaseUrl }).then(result => {
+      setModelSuggestions(prev => ({ ...prev, [provider]: 'models' in result ? result.models.map(model => model.id) : undefined }));
+    });
+  };
   const initialForm = useRef<Partial<AppSettings>>({
     systemPrompt, customBaseUrl, customKey, customModel, openAiKey, openAiModel,
     anthropicKey, anthropicModel, groqKey, groqModel, ollamaUrl, ollamaModel,
@@ -215,6 +226,8 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
                 type="text"
                 value={customModel}
                 onChange={(e) => setCustomModel(e.target.value)}
+                onFocus={() => suggestModels("custom")}
+                list="models-custom"
                 placeholder="custom-model-name"
                 className="w-full bg-muted/20 border border-input rounded-xl px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
               />
@@ -337,7 +350,9 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
                         type="text"
                         value={openAiModel}
                         onChange={(e) => setOpenAiModel(e.target.value)}
-                        placeholder="gpt-5.6-luna"
+                        onFocus={() => suggestModels("openai")}
+                        list="models-openai"
+                        placeholder={DEFAULT_MODELS.openai}
                         className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                       />
                     </div>
@@ -364,7 +379,9 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
                         type="text"
                         value={anthropicModel}
                         onChange={(e) => setAnthropicModel(e.target.value)}
-                        placeholder="claude-sonnet-5"
+                        onFocus={() => suggestModels("anthropic")}
+                        list="models-anthropic"
+                        placeholder={DEFAULT_MODELS.anthropic}
                         className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                       />
                     </div>
@@ -391,7 +408,9 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
                         type="text"
                         value={groqModel}
                         onChange={(e) => setGroqModel(e.target.value)}
-                        placeholder="qwen/qwen3.6-27b"
+                        onFocus={() => suggestModels("groq")}
+                        list="models-groq"
+                        placeholder={DEFAULT_MODELS.groq}
                         className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                       />
                     </div>
@@ -418,7 +437,9 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
                         type="text"
                         value={ollamaModel}
                         onChange={(e) => setOllamaModel(e.target.value)}
-                        placeholder="llama3"
+                        onFocus={() => suggestModels("ollama")}
+                        list="models-ollama"
+                        placeholder={DEFAULT_MODELS.ollama}
                         className="w-full bg-muted/20 border border-input rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                       />
                     </div>
@@ -520,6 +541,11 @@ function SettingsForm({ onRestoreBackup }: { onRestoreBackup: () => void }) {
           </button>
         </div>
       </div>
+      {(Object.keys(modelSuggestions) as ModelProvider[]).map(provider => (
+        <datalist key={provider} id={`models-${provider}`}>
+          {modelSuggestions[provider]?.map(id => <option key={id} value={id} />)}
+        </datalist>
+      ))}
     </div>
   );
 }

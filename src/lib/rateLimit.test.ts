@@ -9,6 +9,7 @@ const envKeys = [
   "UPSTASH_REDIS_REST_TOKEN",
   "RATE_LIMIT_CHAT_PER_MINUTE",
   "RATE_LIMIT_MCP_PER_MINUTE",
+  "RATE_LIMIT_MODELS_PER_MINUTE",
   "RATE_LIMIT_REQUIRED",
   "RATE_LIMIT_FAIL_OPEN",
   "RATE_LIMIT_IP_HEADER",
@@ -91,6 +92,16 @@ test("rate limit: chat and MCP defaults and overrides are separate", async (t) =
   process.env.RATE_LIMIT_MCP_PER_MINUTE = "5";
   assert.equal((await checkRateLimit(request(), "chat")).allowed, false);
   assert.deepEqual(await checkRateLimit(request(), "mcp"), { allowed: true, remaining: 1 });
+});
+
+test("rate limit: models scope has its own key, default of 30 and override", async (t) => {
+  setup(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => transactionResult(4));
+  assert.deepEqual(await checkRateLimit(request(), "models"), { allowed: true, remaining: 26 });
+  const [, options] = fetch.mock.calls[0].arguments as [string, RequestInit];
+  assert.equal(JSON.parse(String(options.body))[0][1], "ratelimit:models:shared");
+  process.env.RATE_LIMIT_MODELS_PER_MINUTE = "3";
+  assert.equal((await checkRateLimit(request(), "models")).allowed, false);
 });
 
 test("rate limit: required Redis and incomplete credentials fail closed", async (t) => {

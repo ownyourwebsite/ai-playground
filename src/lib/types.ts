@@ -42,7 +42,7 @@ export type Usage = {
 };
 
 export type ChatError = {
-  category: "app-rate-limit" | "redis-unavailable" | "provider-rate-limit" | "quota" | "context" | "auth" | "provider" | "network" | "timeout" | "interrupted" | "response-limit" | "content-filter" | "protocol" | "mcp" | "storage" | "attachment" | "request" | "tool-schema" | "image-incompatible" | "model-not-found";
+  category: "app-rate-limit" | "redis-unavailable" | "provider-rate-limit" | "quota" | "context" | "auth" | "provider" | "network" | "timeout" | "interrupted" | "response-limit" | "content-filter" | "protocol" | "mcp" | "storage" | "attachment" | "request" | "tool-schema" | "image-incompatible" | "model-not-found" | "org-verification" | "private-network";
   message: string;
   retryable: boolean;
   retryAt?: number;
@@ -172,6 +172,8 @@ export type AppSettings = {
   defaultModel?: string;
   githubWriteMode?: boolean;
   theme?: "light" | "dark" | "system";
+  /** Version of the one-time settings migrations already applied (see settingsMigration.ts). */
+  settingsVersion?: number;
 };
 
 export type GitHubContext = {

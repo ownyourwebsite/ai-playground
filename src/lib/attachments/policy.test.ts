@@ -10,14 +10,15 @@ test('attachment policy: shared limits are stable', () => {
 test('attachment policy: exact official IDs only, no optimistic prefixes or aliases', () => {
   for (const [provider, model] of [
     ['openai', 'gpt-4o'], ['openai', 'gpt-4o-mini-2024-07-18'], ['openai', 'gpt-4.1-2025-04-14'],
-    ['anthropic', 'claude-3-haiku-20240307'], ['groq', 'meta-llama/llama-4-scout-17b-16e-instruct'],
+    ['openai', 'gpt-5'], ['anthropic', 'claude-3-haiku-20240307'], ['anthropic', 'claude-sonnet-5'],
+    ['anthropic', 'claude-haiku-4-5-20251001'], ['groq', 'meta-llama/llama-4-scout-17b-16e-instruct'],
   ]) assert.equal(getImageSupport(provider, model), 'supported');
   for (const [provider, model] of [
     ['openai', 'gpt-3.5-turbo'], ['openai', 'gpt-4'], ['openai', 'o3-mini'],
     ['anthropic', 'claude-2.1'], ['groq', 'llama-3.3-70b-versatile'], ['groq', 'qwen/qwen3-32b'],
   ]) assert.equal(getImageSupport(provider, model), 'unsupported');
   for (const [provider, model] of [
-    ['openai', 'gpt-5.6-luna'], ['anthropic', 'claude-sonnet-5'], ['groq', 'qwen/qwen3.6-27b'],
+    ['openai', 'gpt-5.6-luna'], ['anthropic', 'claude-sonnet-5-made-up'], ['groq', 'qwen/qwen3.8-27b'],
     ['openai', 'gpt-4o-made-up'], ['openai', 'gpt-4o-2099-01-01'], ['openai', 'GPT-4o'],
     ['openai', ' gpt-4o'], ['openai', 'ft:gpt-4o:custom'], ['openai', 'gpt-4-made-up'],
     ['anthropic', 'claude-3-made-up'], ['openai', ''], ['constructor', 'gpt-4o'], ['__proto__', 'gpt-4o'],

@@ -7,7 +7,7 @@ import { isIP } from "node:net";
  * IP identity is trusted only through an operator-selected, overwritten header;
  * otherwise all requests in a scope share a bucket.
  */
-type RateLimitScope = "chat" | "mcp";
+type RateLimitScope = "chat" | "mcp" | "models";
 
 export type RateLimitResult =
   | { allowed: true; remaining?: number }
@@ -15,6 +15,12 @@ export type RateLimitResult =
 
 const WINDOW_SECONDS = 60;
 const UNAVAILABLE_RETRY_SECONDS = 5;
+
+const SCOPE_LIMITS: Record<RateLimitScope, { env: string; fallback: number }> = {
+  chat: { env: "RATE_LIMIT_CHAT_PER_MINUTE", fallback: 20 },
+  mcp: { env: "RATE_LIMIT_MCP_PER_MINUTE", fallback: 60 },
+  models: { env: "RATE_LIMIT_MODELS_PER_MINUTE", fallback: 30 },
+};
 
 function booleanEnv(name: string): boolean {
   const raw = process.env[name]?.trim();
@@ -146,7 +152,7 @@ export async function checkRateLimit(req: Request, scope: RateLimitScope): Promi
       url: transactionUrl(url),
       token,
       key: `ratelimit:${scope}:${clientIdentity(req, process.env.RATE_LIMIT_IP_HEADER?.trim() ?? "")}`,
-      limit: positiveIntegerEnv(scope === "chat" ? "RATE_LIMIT_CHAT_PER_MINUTE" : "RATE_LIMIT_MCP_PER_MINUTE", scope === "chat" ? 20 : 60),
+      limit: positiveIntegerEnv(SCOPE_LIMITS[scope].env, SCOPE_LIMITS[scope].fallback),
       timeoutMs: positiveIntegerEnv("RATE_LIMIT_TIMEOUT_MS", 2000, 10000),
       failOpen,
     };

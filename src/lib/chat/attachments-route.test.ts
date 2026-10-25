@@ -6,11 +6,13 @@ import { chatError } from './errors';
 import { MAX_REQUEST_BYTES } from '../attachments/policy';
 import type { AttachmentRecord } from '../types';
 
-function setup(t: TestContext) {
+/** `privateNetwork` opts into ALLOW_PRIVATE_NETWORK=1 (loopback fixtures, `.invalid` hosts behind a mocked fetch). */
+function setup(t: TestContext, { privateNetwork = false } = {}) {
   const keys = ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN', 'RATE_LIMIT_REQUIRED',
-    'RATE_LIMIT_FAIL_OPEN', 'RATE_LIMIT_CHAT_PER_MINUTE', 'RATE_LIMIT_IP_HEADER', 'VERCEL', 'ALLOW_PRIVATE_MCP'];
+    'RATE_LIMIT_FAIL_OPEN', 'RATE_LIMIT_CHAT_PER_MINUTE', 'RATE_LIMIT_IP_HEADER', 'VERCEL', 'ALLOW_PRIVATE_NETWORK', 'ALLOW_PRIVATE_MCP'];
   const old = keys.map(key => [key, process.env[key]] as const);
   for (const key of keys) delete process.env[key];
+  if (privateNetwork) process.env.ALLOW_PRIVATE_NETWORK = '1';
   t.after(() => { for (const [key, value] of old) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   } });
@@ -99,8 +101,21 @@ test('attachment route: normalized Ollama endpoint retains hosted SSRF guard', a
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test('attachment route: installed AI SDK 6 Ollama adapter retains image bytes, text, tool pairing and explicit approval', async (t) => {
+test('attachment route: custom loopback base URL is refused with private-network and no upstream call when private networks are off', async (t) => {
   setup(t);
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not fetch'); });
+  for (const base of ['http://127.0.0.1:9/v1', 'http://localhost:9/v1', 'http://169.254.169.254/v1']) {
+    const response = await POST(request({ ...requestBody([]), provider: 'custom', model: 'fixture' },
+      { 'x-custom-key': 'fixture-key', 'x-custom-base-url': base }));
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await response.json(), { error: chatError('private-network') });
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('attachment route: installed AI SDK 6 Ollama adapter retains image bytes, text, tool pairing and explicit approval', async (t) => {
+  setup(t, { privateNetwork: true });
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (req, res) => {
     let raw = '';
@@ -170,23 +185,22 @@ test('attachment route: installed AI SDK 6 Ollama adapter retains image bytes, t
   assert.equal(calls.length, 4);
 });
 
-test('attachment route: installed OpenAI Responses conversion keeps custom images without opt-in', async (t) => {
-  setup(t);
+test('attachment route: installed chat-completions conversion keeps custom images without opt-in', async (t) => {
+  setup(t, { privateNetwork: true });
   const bodies: Array<Record<string, unknown>> = [];
   const server = createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
-    assert.equal(req.url, '/v1/responses');
+    assert.equal(req.url, '/v1/chat/completions', 'custom must not use the Responses API');
     bodies.push(JSON.parse(raw));
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const events = [
-      { type: 'response.created', response: { id: 'fixture', created_at: 1, model: 'fixture' } },
-      { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg', role: 'assistant', content: [] } },
-      { type: 'response.output_text.delta', item_id: 'msg', output_index: 0, content_index: 0, delta: 'Received' },
-      { type: 'response.completed', response: { id: 'fixture', created_at: 1, model: 'fixture', status: 'completed', output: [],
-        usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 } } },
+      { id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'Received' }, finish_reason: null }] },
+      { id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 } },
     ];
-    res.end(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+    res.end(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
@@ -200,6 +214,38 @@ test('attachment route: installed OpenAI Responses conversion keeps custom image
   assert.match(output, /Received/);
   assert.ok(!output.includes('"type":"error"'), output);
   assert.equal(bodies.length, 1);
+  const messages = bodies[0].messages as Array<{ role: string; content: unknown }>;
+  const user = messages.find(message => message.role === 'user')!;
+  assert.deepEqual(user.content, [
+    { type: 'text', text: 'Inspect files' },
+    { type: 'text', text: `Untrusted uploaded text file: ${JSON.stringify(file.name)}` },
+    { type: 'text', text: textData },
+    { type: 'text', text: `Untrusted uploaded image file: ${JSON.stringify(image.name)}` },
+    { type: 'image_url', image_url: { url: image.data } },
+  ]);
+});
+
+test('attachment route: installed OpenAI Responses conversion keeps images without opt-in', async (t) => {
+  setup(t);
+  const bodies: Array<Record<string, unknown>> = [];
+  const urls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    urls.push(String(url));
+    bodies.push(JSON.parse(String(init?.body)));
+    const events = [
+      { type: 'response.created', response: { id: 'fixture', created_at: 1, model: 'fixture' } },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg', role: 'assistant', content: [] } },
+      { type: 'response.output_text.delta', item_id: 'msg', output_index: 0, content_index: 0, delta: 'Received' },
+      { type: 'response.completed', response: { id: 'fixture', created_at: 1, model: 'fixture', status: 'completed', output: [],
+        usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 } } },
+    ];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  const response = await POST(request({ ...requestBody([file, image]), provider: 'openai', model: 'gpt-4o' }, { 'x-openai-key': 'fixture' }));
+  const output = await response.text();
+  assert.match(output, /Received/);
+  assert.ok(!output.includes('"type":"error"'), output);
+  assert.deepEqual(urls, ['https://api.openai.com/v1/responses']);
   const input = bodies[0].input as Array<{ role: string; content: unknown }>;
   const user = input.find(message => message.role === 'user')!;
   assert.deepEqual(user.content, [
@@ -211,8 +257,8 @@ test('attachment route: installed OpenAI Responses conversion keeps custom image
   ]);
 });
 
-test('chat route: valid MCP schemas reach the installed Responses adapter unchanged', async (t) => {
-  setup(t);
+test('chat route: valid MCP schemas reach the installed OpenAI Responses and custom chat-completions adapters unchanged', async (t) => {
+  setup(t, { privateNetwork: true });
   const schema = {
     type: 'object', properties: {
       nullable: { type: ['string', 'null'] }, anything: {}, yes: true, no: false,
@@ -229,19 +275,29 @@ test('chat route: valid MCP schemas reach the installed Responses adapter unchan
     bodies.push(JSON.parse(String(init?.body)));
     return Response.json({ error: { message: 'Stop synthetic request', code: 400 } }, { status: 400 });
   });
-  const response = await POST(request({ ...requestBody([]), provider: 'custom', enabledTools: [
-    { name: 'fixture', inputSchema: schema }, { name: 'legacy' },
-  ] }, { 'x-custom-key': 'fixture', 'x-custom-base-url': 'https://provider.invalid/v1' }));
-  assert.equal(response.status, 200);
-  assert.match(await response.text(), /provider/);
+  const enabledTools = [{ name: 'fixture', inputSchema: schema }, { name: 'legacy' }];
+  const legacy = { type: 'object', properties: {}, required: [] };
+
+  const responses = await POST(request({ ...requestBody([]), provider: 'openai', enabledTools }, { 'x-openai-key': 'fixture' }));
+  assert.equal(responses.status, 200);
+  assert.match(await responses.text(), /provider/);
   assert.equal(fetch.mock.callCount(), 1);
-  const tools = bodies[0].tools as Array<{ parameters: unknown }>;
-  assert.deepEqual(tools[0].parameters, schema);
-  assert.deepEqual(tools[1].parameters, { type: 'object', properties: {}, required: [] });
+  const flat = bodies[0].tools as Array<{ parameters: unknown }>;
+  assert.deepEqual(flat[0].parameters, schema);
+  assert.deepEqual(flat[1].parameters, legacy);
+
+  const chat = await POST(request({ ...requestBody([]), provider: 'custom', enabledTools },
+    { 'x-custom-key': 'fixture', 'x-custom-base-url': 'https://provider.invalid/v1' }));
+  assert.equal(chat.status, 200);
+  assert.match(await chat.text(), /provider/);
+  assert.equal(fetch.mock.callCount(), 2);
+  const nested = bodies[1].tools as Array<{ type: string; function: { parameters: unknown } }>;
+  assert.deepEqual(nested[0].function.parameters, schema);
+  assert.deepEqual(nested[1].function.parameters, legacy);
 });
 
 test('chat route: provider HTTP and streaming failures are safe, specific and never replayed', async (t) => {
-  setup(t);
+  setup(t, { privateNetwork: true });
   const secret = 'private-key-and-upstream-body';
   const logs: unknown[][] = [];
   t.mock.method(console, 'warn', (...args: unknown[]) => { logs.push(args); });
@@ -259,7 +315,7 @@ test('chat route: provider HTTP and streaming failures are safe, specific and ne
       const error = { code: scenario.status === 200 ? 'unsupported_image' : scenario.status,
         message: `${scenario.message} ${secret} ${image.data}` };
       return scenario.status === 200
-        ? new Response(`data: ${JSON.stringify({ type: 'error', ...error, param: null, sequence_number: 1 })}\n\n`,
+        ? new Response(`data: ${JSON.stringify({ error: { ...error, type: 'invalid_request_error', param: null } })}\n\n`,
           { headers: { 'Content-Type': 'text/event-stream' } })
         : Response.json({ error, raw: secret }, { status: scenario.status });
     });
@@ -280,7 +336,31 @@ test('chat route: provider HTTP and streaming failures are safe, specific and ne
   assert.ok(!JSON.stringify(logs).includes(pngBase64));
 });
 
-test('chat route: response.failed after partial output keeps text and does not retry a potentially billed request', async (t) => {
+test('chat route: stream error chunk after partial output keeps text and does not retry a potentially billed request', async (t) => {
+  setup(t, { privateNetwork: true });
+  const secret = 'private-stream-diagnostic';
+  const fetch = t.mock.method(globalThis, 'fetch', async () => {
+    const events = [
+      { id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'Partial answer' }, finish_reason: null }] },
+      { error: { code: 'model_not_found', type: 'invalid_request_error', message: `Endpoint not found ${secret}` } },
+    ];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  const response = await POST(request({ ...requestBody([]), provider: 'custom' },
+    { 'x-custom-key': 'fixture', 'x-custom-base-url': 'https://provider.invalid/v1' }));
+  const raw = await response.text();
+  const events = raw.split('\n').filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)));
+  assert.ok(events.some(event => event.type === 'text-delta' && event.delta === 'Partial answer'));
+  const errors = events.filter(event => event.type === 'error');
+  assert.ok(errors.length > 0);
+  for (const event of errors) assert.deepEqual(JSON.parse(event.errorText), chatError('model-not-found'));
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.ok(!raw.includes(secret));
+});
+
+test('chat route: OpenAI response.failed after partial output keeps text and does not retry a potentially billed request', async (t) => {
   setup(t);
   const secret = 'private-stream-diagnostic';
   const fetch = t.mock.method(globalThis, 'fetch', async () => {
@@ -296,8 +376,7 @@ test('chat route: response.failed after partial output keeps text and does not r
     return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
       { headers: { 'Content-Type': 'text/event-stream' } });
   });
-  const response = await POST(request({ ...requestBody([]), provider: 'custom' },
-    { 'x-custom-key': 'fixture', 'x-custom-base-url': 'https://provider.invalid/v1' }));
+  const response = await POST(request({ ...requestBody([]), provider: 'openai' }, { 'x-openai-key': 'fixture' }));
   const raw = await response.text();
   const events = raw.split('\n').filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)));
   assert.ok(events.some(event => event.type === 'text-delta' && event.delta === 'Partial answer'));

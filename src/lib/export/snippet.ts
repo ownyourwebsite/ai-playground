@@ -1,4 +1,5 @@
 import { Message } from "../types";
+import { DEFAULT_MODELS } from "../providers";
 
 export function generateCurl(
   provider: string,
@@ -24,7 +25,7 @@ export function generateCurl(
   -H "Authorization: Bearer ${resolvedKey}" \\
   -d '${JSON.stringify(
     {
-      model: model || "gpt-4o",
+      model: model || DEFAULT_MODELS.openai,
       messages: formattedMessages,
       stream: true,
     },
@@ -40,7 +41,7 @@ export function generateCurl(
   -H "anthropic-version: 2023-06-01" \\
   -d '${JSON.stringify(
     {
-      model: model || "claude-3-5-sonnet-latest",
+      model: model || DEFAULT_MODELS.anthropic,
       messages: formattedMessages.filter((m) => m.role !== "system"),
       system: systemPrompt,
       max_tokens: 1024,
@@ -57,7 +58,7 @@ export function generateCurl(
   -H "Authorization: Bearer ${resolvedKey}" \\
   -d '${JSON.stringify(
     {
-      model: model || "llama-3.1-70b-versatile",
+      model: model || DEFAULT_MODELS.groq,
       messages: formattedMessages,
       stream: true,
     },
@@ -71,7 +72,7 @@ export function generateCurl(
   -H "Content-Type: application/json" \\
   -d '${JSON.stringify(
     {
-      model: model || "llama3",
+      model: model || DEFAULT_MODELS.ollama,
       messages: formattedMessages,
       stream: false,
     },

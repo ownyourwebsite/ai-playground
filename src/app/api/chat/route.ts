@@ -4,14 +4,16 @@ import type { AttachmentRecord, ChatRequestTool } from '@/lib/types';
 import { normalizeOllamaBaseUrl } from '@/lib/chat/ollama';
 import { streamText, jsonSchema, ModelMessage, LanguageModel, JSONSchema7, TextPart, ToolCallPart, ToolResultPart } from 'ai';
 import { checkRateLimit, rateLimitErrorResponse } from '@/lib/rateLimit';
-import { isUrlSsrfSafe } from '@/lib/ssrf';
+import { isUrlSsrfSafe, ssrfSafeFetch } from '@/lib/ssrf';
+import { DEFAULT_MODELS } from '@/lib/providers';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGroq } from '@ai-sdk/groq';
 
-// Route segment config: allows longer function executions on Vercel/deployments
-// while extended reasoning ("thinking") is being generated (long latencies).
-export const maxDuration = 60;
+// Route segment config: extended reasoning ("thinking") can stream for minutes.
+// 300s is the Vercel maximum with Fluid compute (on by default, Hobby included).
+// A Hobby project without Fluid compute is capped at 60s: lower this to deploy.
+export const maxDuration = 300;
 
 type IncomingToolInvocation = {
   toolCallId?: string;
@@ -57,73 +59,64 @@ export async function POST(req: Request) {
 
     if (provider === 'openai') {
       const openai = createOpenAI({ apiKey: openaiKey });
-      resolvedModel = model || 'gpt-5.6-luna';
+      resolvedModel = model || DEFAULT_MODELS.openai;
       languageModel = openai(resolvedModel);
     } else if (provider === 'anthropic') {
       const anthropic = createAnthropic({ apiKey: anthropicKey });
-      resolvedModel = model || 'claude-sonnet-5';
+      resolvedModel = model || DEFAULT_MODELS.anthropic;
       languageModel = anthropic(resolvedModel);
     } else if (provider === 'groq') {
       const groq = createGroq({ apiKey: groqKey });
-      resolvedModel = model || 'qwen/qwen3.6-27b';
+      resolvedModel = model || DEFAULT_MODELS.groq;
       languageModel = groq(resolvedModel);
-    } else if (provider === 'ollama') {
-      const ollamaBase = normalizeOllamaBaseUrl(ollamaUrl || undefined);
+    } else if (provider === 'ollama' || provider === 'custom') {
+      const baseURL = provider === 'ollama' ? normalizeOllamaBaseUrl(ollamaUrl || undefined) : customBaseUrl || undefined;
 
-      // SSRF guard: on hosted deployments the baseURL comes from the request
-      // body, so without this check anyone could make the server talk to its
-      // own internal network (metadata endpoints, localhost services, ...).
-      // Local development (no VERCEL env) stays unrestricted so users can
-      // keep using their local Ollama out of the box.
-      if (process.env.VERCEL && process.env.ALLOW_PRIVATE_MCP !== '1') {
-        const safe = await isUrlSsrfSafe(ollamaBase);
-        if (!safe) {
-          return new Response(
-            JSON.stringify({ error: 'Ollama URL must be a public HTTPS endpoint on hosted deployments.' }),
-            { status: 400, headers: { 'Content-Type': 'application/json' } }
-          );
-        }
+      // SSRF guard: these base URLs come from the request, so without it anyone
+      // could make the server reach its own network (metadata endpoints,
+      // localhost services). `npm run dev` and ALLOW_PRIVATE_NETWORK=1 allow
+      // private targets; ssrfSafeFetch re-checks DNS at connect time.
+      if (baseURL && !(await isUrlSsrfSafe(baseURL))) {
+        return Response.json({ error: chatError('private-network') }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
       }
 
-      // ollama-ai-provider@1 implements SDK V1, unsupported by AI SDK 6.
-      // Use the installed V3 chat-completions adapter, not an unsafe type cast.
-      const ollama = createOpenAI({ baseURL: ollamaBase, apiKey: 'ollama' });
-      resolvedModel = model || 'llama3';
-      languageModel = ollama.chat(resolvedModel);
-    } else if (provider === 'custom') {
-      const customProvider = createOpenAI({
-        apiKey: customKey,
-        baseURL: customBaseUrl,
+      // Chat Completions, not Responses: it is what Ollama and most
+      // OpenAI-compatible servers implement. ollama-ai-provider@1 implements
+      // SDK V1, unsupported by AI SDK 6, so Ollama uses this adapter too.
+      const compatible = createOpenAI({
+        baseURL,
+        apiKey: provider === 'ollama' ? 'ollama' : customKey,
+        fetch: ssrfSafeFetch,
       });
-      resolvedModel = model || 'custom';
-      languageModel = customProvider(resolvedModel);
+      resolvedModel = model || DEFAULT_MODELS[provider];
+      languageModel = compatible.chat(resolvedModel);
     } else {
       return new Response(JSON.stringify({ error: `Provider ${provider} not supported` }), { status: 400 });
     }
 
-    // Provider-specific options that request extended reasoning ("thinking") on
-    // models that support it. Models that reject these options (the legacy
-    // claude-3 ids, non-reasoning openai/groq ids) are gated out so they don't
-    // error with a 400. Reasoning text returned by the SDK streams back over
-    // the wire as its own parts — it is never injected into the visible text.
+    // Provider-specific options that request visible reasoning ("thinking") on
+    // models that support it. Options a model would reject with a 400 are gated
+    // by model id. Reasoning streams back as its own parts, never as visible
+    // text, and is not replayed in later requests (see the conversion below).
     let providerOptions: NonNullable<Parameters<typeof streamText>[0]['providerOptions']> | undefined;
     if (provider === 'anthropic') {
-      // "adaptive" thinking (no budgetTokens) is the gen-5 path. The claude-3
-      // ids would reject these options, so only apply to anything that isn't
-      // a claude-3-* id.
-      if (!/^claude-3-?/.test(resolvedModel)) {
-        providerOptions = { anthropic: { thinking: { type: 'adaptive' }, effort: 'medium' } };
+      // Adaptive thinking and effort exist from Opus/Sonnet 4.6 and on every
+      // gen-5 model; older ids reject both. Newer models omit thinking text
+      // unless display is "summarized".
+      if (/^claude-(?:(?:opus|sonnet)-4-[6-9]|[a-z]+-[5-9])/.test(resolvedModel)) {
+        providerOptions = { anthropic: { thinking: { type: 'adaptive', display: 'summarized' }, effort: 'medium' } };
       }
     } else if (provider === 'openai') {
-      if (/(^|-)o1/.test(resolvedModel) || /gpt-5/i.test(resolvedModel)) {
-        providerOptions = { openai: { reasoningEffort: 'medium' } };
-      }
+      // store:false keeps conversations out of OpenAI's server-side storage.
+      // The SDK sends the reasoning options only to reasoning models (o-series,
+      // gpt-5+); a summary is the only reasoning text OpenAI returns.
+      providerOptions = { openai: { store: false, reasoningEffort: 'medium', reasoningSummary: 'auto' } };
     } else if (provider === 'groq') {
-      // Qwen3 thinking is opt-in, and reasoning text is only streamed back when
-      // reasoningFormat is "raw". Non-qwen groq models (llama/mixtral) would
-      // error on these, so gate on the model id containing "qwen".
-      if (resolvedModel.toLowerCase().includes('qwen')) {
-        providerOptions = { groq: { reasoningEffort: 'medium', reasoningFormat: 'raw' } };
+      // Qwen3 reasons by default; "parsed" streams it as reasoning parts and,
+      // unlike "raw", is accepted together with tools. Its reasoning_effort only
+      // takes none/default, so it is left unset.
+      if (/qwen/i.test(resolvedModel)) {
+        providerOptions = { groq: { reasoningFormat: 'parsed' } };
       }
     }
     // ollama / custom intentionally get no providerOptions: local models embed
@@ -217,7 +210,7 @@ export async function POST(req: Request) {
           (!tool.serverId && !!schema.properties && ('owner' in schema.properties || 'repo' in schema.properties));
 
         if (isGithubTool && githubContext) {
-          const repoNote = `\nRepository context is available: owner=${githubContext.owner}, repo=${githubContext.repo}.\nUse these exact argument keys. Required: ${schema.required?.join(', ') || 'none'}. ${tool.name === 'get_file_contents' ? 'For the repository README, path is README.md.' : ''}`;
+          const repoNote = `\nRepository context is available: owner=${githubContext.owner}, repo=${githubContext.repo}.\nUse these exact argument keys. Required: ${schema.required?.join(', ') || 'none'}. ${(tool.originalName ?? tool.name) === 'get_file_contents' ? 'For the repository README, path is README.md.' : ''}`;
           description += repoNote;
         }
 

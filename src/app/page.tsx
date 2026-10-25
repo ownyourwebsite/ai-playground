@@ -29,6 +29,7 @@ import { createRecoveryExport, MAX_RECOVERY_BYTES, RecoveryStorageError, Recover
 import { storageErrorCode } from "@/lib/storageErrors";
 import { callMcpTool } from "@/lib/mcp/client";
 import { resolveGithubToolArgs, validateToolArgs } from "@/lib/mcp/utils";
+import { assignToolNames } from "@/lib/mcp/toolNames";
 import { filterGithubTools } from "@/lib/mcp/githubTools";
 import { parseReasoning } from "@/lib/reasoning";
 import ReasoningAccordion from "@/components/ReasoningAccordion";
@@ -37,6 +38,9 @@ import ExecutionStatus from "@/components/ExecutionStatus";
 import { ChatExecution, canContinueModel, type ModelRequest } from "@/lib/chat/execution";
 import { chatError } from "@/lib/chat/errors";
 import { useChatScroll } from "@/lib/chat/useChatScroll";
+import { contextTokens, formatTokens } from "@/lib/chat/contextUsage";
+import { DEFAULT_MODELS } from "@/lib/providers";
+import { contextWindowFor, fetchModelList, type ModelProvider } from "@/lib/models/client";
 import { canRetryTool } from "@/lib/chat/toolSafety";
 import { AttachmentRecord, Message, McpServer, McpTool, ToolInvocation, AppSettings, SavedProvider, ChatRequestBody, ChatError } from "@/lib/types";
 
@@ -146,13 +150,13 @@ function WorkspaceContent() {
     }
     switch (uiModel) {
       case "openai":
-        return { provider: "openai", model: currentSettings.openAiModel || "gpt-5.6-luna" };
+        return { provider: "openai", model: currentSettings.openAiModel || DEFAULT_MODELS.openai };
       case "anthropic":
-        return { provider: "anthropic", model: currentSettings.anthropicModel || "claude-sonnet-5" };
+        return { provider: "anthropic", model: currentSettings.anthropicModel || DEFAULT_MODELS.anthropic };
       case "groq":
-        return { provider: "groq", model: currentSettings.groqModel || "qwen/qwen3.6-27b" };
+        return { provider: "groq", model: currentSettings.groqModel || DEFAULT_MODELS.groq };
       case "ollama":
-        return { provider: "ollama", model: currentSettings.ollamaModel || "llama3" };
+        return { provider: "ollama", model: currentSettings.ollamaModel || DEFAULT_MODELS.ollama };
       case "custom":
         return { provider: "custom", model: currentSettings.customModel || "custom" };
       default:
@@ -171,16 +175,16 @@ function WorkspaceContent() {
       });
     }
     if (settings.openAiKey) {
-      options.push({ value: "openai", label: `OpenAI (${settings.openAiModel || "gpt-5.6-luna"})` });
+      options.push({ value: "openai", label: `OpenAI (${settings.openAiModel || DEFAULT_MODELS.openai})` });
     }
     if (settings.anthropicKey) {
-      options.push({ value: "anthropic", label: `Anthropic (${settings.anthropicModel || "claude-sonnet-5"})` });
+      options.push({ value: "anthropic", label: `Anthropic (${settings.anthropicModel || DEFAULT_MODELS.anthropic})` });
     }
     if (settings.groqKey) {
-      options.push({ value: "groq", label: `Groq (${settings.groqModel || "qwen/qwen3.6-27b"})` });
+      options.push({ value: "groq", label: `Groq (${settings.groqModel || DEFAULT_MODELS.groq})` });
     }
     if (settings.ollamaUrl) {
-      options.push({ value: "ollama", label: `Ollama (${settings.ollamaModel || "llama3"})` });
+      options.push({ value: "ollama", label: `Ollama (${settings.ollamaModel || DEFAULT_MODELS.ollama})` });
     }
     return options;
   }, [
@@ -201,10 +205,33 @@ function WorkspaceContent() {
   const selectedProvider = getProviderAndModel(selectedModel, settings);
   const imageSupport = getImageSupport(selectedProvider.provider, selectedProvider.model);
   const hasImages = draftAttachments.some(file => file.kind === 'image') || messages.some(message => message.attachments?.some(file => file.kind === 'image'));
+  const savedSelection = selectedModel.startsWith('custom-') ? settings.savedProviders?.find(provider => provider.id === selectedModel.slice(7)) : undefined;
   const selectedEndpoint = selectedProvider.provider === 'custom'
-    ? (selectedModel.startsWith('custom-') ? settings.savedProviders?.find(provider => provider.id === selectedModel.slice(7))?.baseUrl : settings.customBaseUrl)
+    ? (selectedModel.startsWith('custom-') ? savedSelection?.baseUrl : settings.customBaseUrl)
     : selectedProvider.provider === 'ollama' ? settings.ollamaUrl : undefined;
+  const selectedKey = selectedProvider.provider === 'custom'
+    ? (selectedModel.startsWith('custom-') ? savedSelection?.key : settings.customKey)
+    : ({ openai: settings.openAiKey, anthropic: settings.anthropicKey, groq: settings.groqKey } as Record<string, string | undefined>)[selectedProvider.provider];
   const imageHintSelection = imageHintIdentity(selectedProvider.provider, selectedProvider.model, selectedEndpoint);
+  const contextUsed = contextTokens(messages);
+  const hasContextUsage = contextUsed !== undefined;
+  const contextWindowKey = `${selectedProvider.provider}|${selectedProvider.model}|${selectedEndpoint ?? ''}`;
+  const [contextWindow, setContextWindow] = useState<{ key: string; tokens?: number }>();
+  const contextLimit = contextWindow?.key === contextWindowKey ? contextWindow.tokens : undefined;
+
+  // The window size comes from the provider's live model list (cached for 10 min);
+  // providers that do not report it simply show the used count alone.
+  useEffect(() => {
+    if (!hasContextUsage) return;
+    const [provider, model] = [selectedProvider.provider as ModelProvider, selectedProvider.model];
+    const controller = new AbortController();
+    // fetchModelList reads only the credential fields of `provider`.
+    const creds = { openAiKey: selectedKey, anthropicKey: selectedKey, groqKey: selectedKey, customKey: selectedKey, ollamaUrl: selectedEndpoint, customBaseUrl: selectedEndpoint };
+    void fetchModelList(provider, creds, controller.signal).then(result => {
+      if ('models' in result) setContextWindow({ key: contextWindowKey, tokens: contextWindowFor(result.models, model) });
+    });
+    return () => controller.abort();
+  }, [hasContextUsage, contextWindowKey, selectedProvider.provider, selectedProvider.model, selectedKey, selectedEndpoint]);
 
   useEffect(() => {
     if (!settingsReady || settingsLoadFailed) return;
@@ -284,12 +311,11 @@ function WorkspaceContent() {
     const current = stateRef.current;
     const { provider, model } = getProviderAndModel(current.selectedModel, current.settings);
     const saved = current.selectedModel.startsWith('custom-') ? current.settings.savedProviders?.find(p => p.id === current.selectedModel.slice(7)) : undefined;
-    const servers = current.mcpServers.filter(s => s.status === 'connected');
-    const enabledTools = servers.flatMap(server => {
-      const tools = server.preset === 'github' ? filterGithubTools(server.tools || [], current.settings.githubWriteMode === true) : server.tools || [];
-      return tools.map(t => ({ ...t, originalName: t.name, serverId: server.id,
-        name: servers.length > 1 ? `${server.name.replace(/\s+/g, '_').toLowerCase()}_${t.name}` : t.name }));
-    });
+    const serverTools = current.mcpServers.filter(s => s.status === 'connected').map(server => ({ server,
+      tools: server.preset === 'github' ? filterGithubTools(server.tools || [], current.settings.githubWriteMode === true) : server.tools || [] }));
+    const providerName = assignToolNames(serverTools.map(({ server, tools }) => ({ id: server.id, name: server.name, tools })));
+    const enabledTools = serverTools.flatMap(({ server, tools }) =>
+      tools.map(t => ({ ...t, originalName: t.name, serverId: server.id, name: providerName(server.id, t.name) })));
     engine.setToolResolver((call, messages) => {
       const def = enabledTools.find(t => t.name === call.toolName);
       const schema = def?.inputSchema || { type: 'object' as const };
@@ -686,6 +712,8 @@ function WorkspaceContent() {
                   <div className="absolute left-3 bottom-3 flex items-center gap-2">
                     <AttachmentControls onChoose={() => fileInput.current?.click()}
                       disabled={readingAttachments || isLoading || !!hasPendingToolApproval || draftAttachments.length >= MAX_ATTACHMENTS} />
+                    {contextUsed !== undefined && <span title={`Context used by the last request: ${contextUsed.toLocaleString('en-US')} tokens (input + output, provider-reported)${contextLimit ? ` of ${contextLimit.toLocaleString('en-US')}` : ''}`}
+                      className="text-[10px] tabular-nums text-muted-foreground">{formatTokens(contextUsed)}{contextLimit ? ` / ${formatTokens(contextLimit)}` : ''} tokens</span>}
                     {readingAttachments && <span role="status" className="text-[10px] text-muted-foreground">Reading locally…</span>}
                     {!!draftAttachments.length && !readingAttachments && <span aria-label="Attachment count" aria-live="polite" aria-atomic="true" className="text-[10px] tabular-nums text-muted-foreground">{draftAttachments.length}/{MAX_ATTACHMENTS}<span className="sr-only"> files attached</span></span>}
                   </div>

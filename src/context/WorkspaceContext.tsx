@@ -6,42 +6,14 @@ import { getSessions, getSettings, saveSettings, getMcpServers, saveMcpServer, d
 import { initializeMcp, listMcpTools, clearMcpSession, McpTool } from "@/lib/mcp/client";
 import { cleanExpiredKeys, refreshKeyExpirations, settingsForStorage, KEY_FIELDS } from "@/lib/keyExpiry";
 import { storageErrorCode } from "@/lib/storageErrors";
+import { migrateSettings, SETTINGS_VERSION } from "@/lib/settingsMigration";
 
 const DEFAULT_SETTINGS: AppSettings = {
   id: "default",
+  settingsVersion: SETTINGS_VERSION,
   systemPrompt: "You are a helpful and precise assistant.",
   rememberKeys: true
 };
-
-// Upgrade stale default model IDs persisted by older versions to the current
-// defaults. User-chosen custom models (anything else) are left untouched.
-const LEGACY_MODEL_DEFAULTS: Record<string, string> = {
-  "gpt-4o": "gpt-5.6-luna",
-  "gpt-4o-mini": "gpt-5.6-luna",
-  "o1-preview": "gpt-5.6-luna",
-  "o1-mini": "gpt-5.6-luna",
-  "claude-3-5-sonnet-latest": "claude-sonnet-5",
-  "claude-3-5-haiku-latest": "claude-sonnet-5",
-  "claude-3-opus-latest": "claude-sonnet-5",
-  "llama-3.3-70b-versatile": "qwen/qwen3.6-27b",
-  "llama-3.1-70b-versatile": "qwen/qwen3.6-27b",
-  "llama-3.1-8b-instant": "qwen/qwen3.6-27b",
-  "mixtral-8x7b-32768": "qwen/qwen3.6-27b",
-};
-
-function migrateSettings(settings: AppSettings): AppSettings {
-  const migrate = (value: string | undefined) =>
-    value && LEGACY_MODEL_DEFAULTS[value] ? LEGACY_MODEL_DEFAULTS[value] : value;
-
-  return {
-    ...settings,
-    openAiModel: migrate(settings.openAiModel),
-    anthropicModel: migrate(settings.anthropicModel),
-    groqModel: migrate(settings.groqModel),
-    ollamaModel: migrate(settings.ollamaModel),
-    customModel: migrate(settings.customModel),
-  };
-}
 
 const DEFAULT_MCP_SERVERS: McpServer[] = [
   { id: "github", name: "GitHub Integration", description: "Create issues, view PRs, search code", url: "https://api.githubcopilot.com/mcp/", preset: "github", status: "disconnected" }
@@ -221,8 +193,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       try {
       const dbSettings = await getSettings();
       if (dbSettings) {
-        // Upgrade stale default model IDs persisted by older versions.
-        const migrated = migrateSettings(dbSettings);
+        // One-time, versioned upgrade of retired model IDs; persisted below with the version stamp.
+        const { settings: migrated, changed } = migrateSettings(dbSettings);
+        if (changed) settingsDirty.current = true;
         // Drop remembered keys whose 30-day expiry has passed (keys saved before
         // this feature have no expiry entry and are left intact). Persist the
         // cleanup so the deletion sticks.
