@@ -22,22 +22,26 @@ const toolSchema = { name: 'get_file_contents', inputSchema: { type: 'object', p
 const writeSchema = { name: 'push_files', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, branch: { type: 'string' }, message: { type: 'string' }, files: { type: 'array' } }, required: ['owner', 'repo', 'branch', 'message', 'files'] } };
 let passes = 0;
 const providerRequests = [];
-// Real route + installed SDK, but only a local synthetic Responses endpoint.
+// Seeded settings carry the current settingsVersion (src/lib/settingsMigration.ts):
+// an unversioned record is re-saved on load, which drops non-remembered keys.
+// Real route + installed SDK, but only a local synthetic Chat Completions endpoint
+// (custom providers speak /chat/completions). The loopback target passes the SSRF
+// guard under `next dev`; against `next start` run the app with ALLOW_PRIVATE_NETWORK=1.
 const provider = createServer(async (req, res) => {
   let body = '';
   for await (const chunk of req) body += chunk;
   providerRequests.push(JSON.parse(body));
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-  const emit = e => res.write(`data: ${JSON.stringify(e)}\n\n`);
-  emit({ type: 'response.created', response: { id: 'resp_stream', created_at: 1, model: 'fixture' } });
-  emit({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_stream', role: 'assistant', content: [] } });
+  const emit = e => res.write(`data: ${JSON.stringify({ id: 'chatcmpl_stream', object: 'chat.completion.chunk', created: 1, model: 'fixture', ...e })}\n\n`);
+  emit({ choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
   for (let i = 0; i < 12 && !res.destroyed; i++) {
-    emit({ type: 'response.output_text.delta', item_id: 'msg_stream', output_index: 0, content_index: 0, delta: `Live chunk ${i}\n${'Streaming fixture text\n'.repeat(3)}` });
+    emit({ choices: [{ index: 0, delta: { content: `Live chunk ${i}\n${'Streaming fixture text\n'.repeat(3)}` }, finish_reason: null }] });
     await new Promise(resolve => setTimeout(resolve, 180));
   }
   if (!res.destroyed) {
-    emit({ type: 'response.completed', response: { id: 'resp_stream', created_at: 1, model: 'fixture', status: 'completed', output: [], usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 2 } } } });
-    res.end();
+    emit({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+    emit({ choices: [], usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28, prompt_tokens_details: { cached_tokens: 4 }, completion_tokens_details: { reasoning_tokens: 2 } } });
+    res.end('data: [DONE]\n\n');
   }
 });
 await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
@@ -94,7 +98,7 @@ async function fixture(writeMode = false) {
       r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
     });
     const tx = db.transaction(['settings', 'sessions'], 'readwrite');
-    tx.objectStore('settings').put({ id: 'default', customKey: 'fixture-not-a-real-key', customBaseUrl: 'https://fixture.invalid/v1', customModel: 'fixture', githubPat: 'fixture-not-a-real-pat', githubWriteMode: writeMode, rememberKeys: false, defaultModel: 'custom', systemPrompt: 'Fixture' });
+    tx.objectStore('settings').put({ id: 'default', settingsVersion: 1, customKey: 'fixture-not-a-real-key', customBaseUrl: 'https://fixture.invalid/v1', customModel: 'fixture', githubPat: 'fixture-not-a-real-pat', githubWriteMode: writeMode, rememberKeys: false, defaultModel: 'custom', systemPrompt: 'Fixture' });
     tx.objectStore('sessions').put({ id: 'history', title: 'Long fixture history', updatedAt: 1, messages: Array.from({ length: 45 }, (_, i) => ({ id: `old-${i}`, role: i % 2 ? 'assistant' : 'user', content: `History ${i}\n${'Preserved text\n'.repeat(5)}` })) });
     await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
     db.close();
@@ -538,7 +542,7 @@ try {
     await page.evaluate(async () => {
       const db = await new Promise(resolve => { const request = indexedDB.open('ai-workspace'); request.onsuccess = () => resolve(request.result); });
       const tx = db.transaction('settings', 'readwrite');
-      tx.objectStore('settings').put({ id: 'default', rememberKeys: true, systemPrompt: '' });
+      tx.objectStore('settings').put({ id: 'default', settingsVersion: 1, rememberKeys: true, systemPrompt: '' });
       await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = reject; }); db.close();
     });
     await page.reload();
@@ -1097,7 +1101,7 @@ try {
     await page.evaluate(async () => {
       const db = await new Promise(resolve => { const r = indexedDB.open('ai-workspace'); r.onsuccess = () => resolve(r.result); });
       const tx = db.transaction('settings', 'readwrite');
-      tx.objectStore('settings').put({ id: 'default', groqKey: 'fake-groq-key', groqModel: 'openai/gpt-oss-20b', defaultModel: 'groq', rememberKeys: true, systemPrompt: '' });
+      tx.objectStore('settings').put({ id: 'default', settingsVersion: 1, groqKey: 'fake-groq-key', groqModel: 'openai/gpt-oss-20b', defaultModel: 'groq', rememberKeys: true, systemPrompt: '' });
       await new Promise(resolve => { tx.oncomplete = resolve; }); db.close();
     });
     await page.reload();
@@ -1121,7 +1125,7 @@ try {
     assert.equal(state.models.length, 3); assert.equal(state.models[2].messages[0].attachments, undefined);
   });
 
-  await scenario('attachments real route: installed SDK sends full text and image data to a local Responses provider', async ({ page, state }) => {
+  await scenario('attachments real route: installed SDK sends full text and image data to a local Chat Completions provider', async ({ page, state }) => {
     const image = await imageFile(page);
     const before = providerRequests.length;
     state.live = true;
@@ -1131,17 +1135,18 @@ try {
     await page.getByLabel('Chat history').getByText(/Live chunk 11/).waitFor(); await idle(page);
     assert.equal(providerRequests.length, before + 1);
     const upstream = providerRequests.at(-1);
-    const parts = upstream.input.filter(item => item.role === 'user').flatMap(item => item.content);
-    assert.ok(parts.some(part => part.type === 'input_image' && part.image_url === `data:image/png;base64,${image.buffer.toString('base64')}`));
-    assert.ok(parts.some(part => part.type === 'input_text' && part.text === '{"local":true}'));
-    assert.ok(parts.some(part => part.type === 'input_text' && part.text === 'Local multimodal end-to-end'));
+    const parts = upstream.messages.filter(item => item.role === 'user').flatMap(item => typeof item.content === 'string' ? [{ type: 'text', text: item.content }] : item.content);
+    assert.ok(parts.some(part => part.type === 'image_url' && part.image_url.url === `data:image/png;base64,${image.buffer.toString('base64')}`));
+    assert.ok(parts.some(part => part.type === 'text' && part.text === '{"local":true}'));
+    assert.ok(parts.some(part => part.type === 'text' && part.text === 'Local multimodal end-to-end'));
+    assert.equal(upstream.stream_options?.include_usage, true);
   });
 
   await scenario('attachments verified model: no compatibility hint is needed and all image bytes are retained', async ({ page, state }) => {
     await page.evaluate(async () => {
       const db = await new Promise(resolve => { const r = indexedDB.open('ai-workspace'); r.onsuccess = () => resolve(r.result); });
       const tx = db.transaction('settings', 'readwrite');
-      tx.objectStore('settings').put({ id: 'default', openAiKey: 'fake-openai-key', openAiModel: 'gpt-4.1', defaultModel: 'openai', rememberKeys: true, systemPrompt: '' });
+      tx.objectStore('settings').put({ id: 'default', settingsVersion: 1, openAiKey: 'fake-openai-key', openAiModel: 'gpt-4.1', defaultModel: 'openai', rememberKeys: true, systemPrompt: '' });
       await new Promise(resolve => { tx.oncomplete = resolve; }); db.close();
     });
     await page.reload();
@@ -1229,7 +1234,7 @@ try {
     await page.evaluate(async () => {
       const db = await new Promise(resolve => { const request = indexedDB.open('ai-workspace'); request.onsuccess = () => resolve(request.result); });
       const tx = db.transaction('settings', 'readwrite');
-      tx.objectStore('settings').put({ id: 'default', customKey: 'synthetic-hint-key', customBaseUrl: 'https://user:synthetic-url-password@fixture.invalid/v1?api_key=synthetic-query-secret', customModel: 'fixture', defaultModel: 'custom', rememberKeys: true, systemPrompt: '' });
+      tx.objectStore('settings').put({ id: 'default', settingsVersion: 1, customKey: 'synthetic-hint-key', customBaseUrl: 'https://user:synthetic-url-password@fixture.invalid/v1?api_key=synthetic-query-secret', customModel: 'fixture', defaultModel: 'custom', rememberKeys: true, systemPrompt: '' });
       await new Promise(resolve => { tx.oncomplete = resolve; }); db.close();
     });
     await page.reload(); await page.getByRole('button', { name: 'Custom (fixture)', exact: true }).waitFor();
