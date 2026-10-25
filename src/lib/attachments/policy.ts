@@ -9,7 +9,7 @@ export const MAX_REQUEST_BYTES = 4_000_000;
 
 // Deliberately small exact allow-lists, NOT model-name heuristics. A supported
 // modality does not guarantee model availability, account access or context fit.
-// Sources: developers.openai.com/api/docs/models/{gpt-4o,gpt-4.1,gpt-4o-mini},
+// Sources: developers.openai.com/api/docs/models/{gpt-4o,gpt-4.1,gpt-4o-mini,gpt-5},
 // docs.anthropic.com/en/docs/about-claude/models/overview,
 // console.groq.com/docs/vision. New IDs/snapshots need individual verification.
 const imageModels: Record<string, ReadonlySet<string>> = {
@@ -20,12 +20,17 @@ const imageModels: Record<string, ReadonlySet<string>> = {
     'gpt-4.1-mini', 'gpt-4.1-mini-2025-04-14',
     'gpt-4.1-nano', 'gpt-4.1-nano-2025-04-14',
     'gpt-4-turbo', 'gpt-4-turbo-2024-04-09', 'gpt-4-vision-preview',
+    'gpt-5', 'gpt-5-mini', 'gpt-5-nano',
   ]),
   anthropic: new Set([
     'claude-3-haiku-20240307', 'claude-3-sonnet-20240229', 'claude-3-opus-20240229',
     'claude-3-5-sonnet-20240620', 'claude-3-5-sonnet-20241022',
     'claude-3-5-haiku-20241022', 'claude-3-7-sonnet-20250219',
     'claude-sonnet-4-20250514', 'claude-opus-4-20250514',
+    'claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-sonnet-4-5', 'claude-sonnet-4-5-20250929',
+    'claude-opus-4-5', 'claude-opus-4-5-20251101', 'claude-opus-4-6', 'claude-sonnet-4-6',
+    'claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-opus-5',
+    'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-fable-5-1',
   ]),
   groq: new Set([
     'meta-llama/llama-4-scout-17b-16e-instruct',
