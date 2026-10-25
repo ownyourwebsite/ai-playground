@@ -6,6 +6,7 @@ import { POST } from '../../app/api/chat/route';
 test('installed ai6 route forwards safe real usage, disables hidden retries and classifies rate limit without leaking upstream', async () => {
   const old = { ...process.env };
   for (const name of ['RATE_LIMIT_REQUIRED', 'UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN']) delete process.env[name];
+  process.env.ALLOW_PRIVATE_NETWORK = '1'; // loopback fixture server
   let calls = 0;
   let fail = false;
   const server = createServer((req, res) => {
@@ -16,13 +17,12 @@ test('installed ai6 route forwards safe real usage, disables hidden retries and 
       res.end(JSON.stringify({ error: { message: 'secret-key=fixture-sensitive', type: 'rate_limit_error' } })); return;
     }
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const chunk = { id: 'chatcmpl_fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture' };
     const events = [
-      { type: 'response.created', response: { id: 'resp_fixture', created_at: 1, model: 'fixture' } },
-      { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_fixture', role: 'assistant', content: [] } },
-      { type: 'response.output_text.delta', item_id: 'msg_fixture', output_index: 0, content_index: 0, delta: 'Fixture answer' },
-      { type: 'response.completed', response: { id: 'resp_fixture', created_at: 1, model: 'fixture', status: 'completed', output: [], usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 2 } } } },
+      { ...chunk, choices: [{ index: 0, delta: { role: 'assistant', content: 'Fixture answer' }, finish_reason: null }] },
+      { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28, prompt_tokens_details: { cached_tokens: 4 }, completion_tokens_details: { reasoning_tokens: 2 } } },
     ];
-    res.end(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''));
+    res.end(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };

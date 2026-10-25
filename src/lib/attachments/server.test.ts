@@ -65,7 +65,7 @@ test('attachments: multiple files become separate labelled text/image parts with
 test('attachments: provider decides image support; legacy boolean acknowledgment has no effect', () => {
   for (const [provider, model] of [
     ['openai', 'gpt-5.6-luna'], ['openai', ''], ['custom', 'gpt-4o'], ['ollama', 'llava'],
-    ['anthropic', 'claude-sonnet-5'], ['groq', 'qwen/qwen3.6-27b'], ['openai', 'gpt-3.5-turbo'],
+    ['anthropic', 'claude-sonnet-5'], ['groq', 'qwen/qwen3.8-27b'], ['openai', 'gpt-3.5-turbo'],
   ]) {
     for (const imageSupportAcknowledged of [undefined, false, true]) {
       const accepted = validateChatRequest({ ...body([image()]), provider, model, imageSupportAcknowledged });

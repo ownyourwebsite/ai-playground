@@ -20,7 +20,9 @@ const messages: Record<ChatError['category'], string> = {
   request: 'The chat request is malformed or exceeds the request limits. Check the message structure and request size.',
   'tool-schema': 'A tool input schema is malformed or too deeply nested. MCP tools require an object root schema. Check or reconnect the tool server.',
   'image-incompatible': 'The provider has no endpoint that supports image input for this model or rejects its image modality. Choose an image-capable model; images in conversation history are also sent.',
-  'model-not-found': 'The requested model or provider endpoint was not found or is unavailable. Check the model ID, provider base URL and model access.',
+  'model-not-found': 'The model was not found: it may be retired, misspelled or not enabled for your account. Open Settings and pick a current model from the suggestions; for a custom provider also check the base URL.',
+  'org-verification': 'OpenAI requires a verified organization for this model or its reasoning summaries. Verify it at platform.openai.com/settings/organization/general (it can take a few minutes to apply), or choose another model.',
+  'private-network': 'This server does not connect to private or local network addresses. Use a public HTTPS endpoint, or set ALLOW_PRIVATE_NETWORK=1 when self-hosting next to a local Ollama or LAN server.',
 };
 export function chatError(category: ChatError['category'], retryable = false, retryAt?: number): ChatError {
   return { category, message: messages[category], retryable, ...(retryAt ? { retryAt } : {}) };
@@ -100,8 +102,12 @@ function imageIncompatible(text: string): boolean {
 /** Raw upstream diagnostics are classification input only, never output/logs. */
 export function classifyError(error: unknown, options: { streaming?: boolean } = {}): ChatError {
   const { text, statuses, retryAt } = providerSignals(error);
+  // SsrfBlockedError (lib/ssrf) thrown at connect time, e.g. a public host that
+  // resolves to a private address. Matched by name/code: this module also runs in the browser.
+  if (text.includes('ssrfblockederror') || text.includes('eblocked')) return chatError('private-network');
   if (/insufficient_quota|quota_exceeded|exceeded.{0,40}quota|\bcredits?\b|\bbalance\b|\bbilling\b|payment required/.test(text) || statuses.has(402)) return chatError('quota');
   if (/context_length|context window|too many tokens|maximum context/.test(text) || statuses.has(413)) return chatError('context');
+  if (/organization must be verified|verify (?:your |the )?organization/.test(text)) return chatError('org-verification');
   if (/api[ _]key.{0,30}(missing|invalid)|invalid_api_key|authentication|unauthorized/.test(text) || statuses.has(401) || statuses.has(403)) return chatError('auth');
   // Match modality rejection, not a corrupt/oversized image or an unrelated
   // 404 merely containing an echoed image. Image incompatibility wins over 404.
