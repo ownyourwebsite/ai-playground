@@ -41,7 +41,7 @@ Open [http://localhost:3000](http://localhost:3000) to view the workspace.
 #### Deploy your own instance on Vercel
 
 1. Fork this repository, then import your fork into Vercel as a Next.js project. Use the repository root and the default build/output settings; select Node.js **22.x**.
-2. Provider keys are entered in the application's Settings, not committed or added as deployment secrets. For a public instance, configure the optional hosting variables from [the environment example](.env.example): supply both Upstash Redis credentials, set `RATE_LIMIT_REQUIRED=1`, and keep `RATE_LIMIT_FAIL_OPEN=0`. Never enable `ALLOW_PRIVATE_MCP` on a public deployment.
+2. Provider keys are entered in the application's Settings, not committed or added as deployment secrets. For a public instance, configure the optional hosting variables from [the environment example](.env.example): supply both Upstash Redis credentials, set `RATE_LIMIT_REQUIRED=1`, and keep `RATE_LIMIT_FAIL_OPEN=0`. Never enable `ALLOW_PRIVATE_NETWORK` on a public deployment. Keep **Fluid compute** enabled so long chat turns are not cut off at 60 seconds.
 3. Deploy, open your new URL and configure your providers. Review the [hosting security guidance](.github/SECURITY.md#hosted-deployments--token-passthrough) before accepting other users' keys. Dependency audit results and abuse protections need a separate review; a successful build is not a security certification.
 
 Chats and keys belong to the browser and origin where they were saved; they do not automatically transfer from localhost or the demo to your deployment. The recovery import transfers backed-up chats/files, not provider keys. A hosted instance also cannot reach Ollama on your computer through its own localhost.
@@ -54,6 +54,8 @@ Chats and keys belong to the browser and origin where they were saved; they do n
    - **Anthropic** (`sk-ant-...`)
    - **Groq** (`gsk_...`)
    - **Ollama** (defaults to local `http://127.0.0.1:11434/api`)
+
+   Default models: `gpt-5.6-luna` (OpenAI), `claude-sonnet-5` (Anthropic), `qwen/qwen3.8-27b` (Groq), `llama3` (Ollama). Focusing a model field fetches the provider's current model list with the key/URL entered so far and offers it as suggestions; any ID can still be typed. A retired or misspelled ID produces an explicit **model not found** error. Custom providers and Ollama are called through the OpenAI-compatible **/chat/completions** endpoint (vLLM, LM Studio, OpenRouter, llama.cpp and similar servers).
 3. **Remember keys on this device** defaults on and stores secrets as plain text in IndexedDB. Turn it off to keep secrets in this tab only; saved provider definitions remain, without their keys. Expiry is checked on load, not a background deletion timer. Saving a top-level key field refreshes its 30-day timestamp; older keys without a timestamp are preserved. Saved custom-provider keys have no per-key expiry.
 
 ### 3. Connect GitHub MCP
@@ -111,6 +113,7 @@ adding it directly in the right sidebar.
 - **Restore backup** is always available in Settings and beside the download action in the storage warning. Select a JSON recovery backup (v1 text-only or v2, **32 MiB maximum**, including base64/whitespace), review chat/message/attachment counts, then explicitly **Import**. Cancel writes nothing. Import atomically creates new copies, leaves original chats, RAM-only chats and settings unchanged, imports no keys and runs no models/tools. Unfinished work in the copies is marked interrupted. Success does not switch chats or disturb the current response/draft; **View restored chat** is an optional, explicit switch.
 - Settings show saving errors instead of reporting success. Keep the same browser origin (scheme, host, and port) and browser profile: changing ports or switching between localhost and 127.0.0.1 uses a different local database. A failed read does not prove deletion. If an upgrade is blocked, close other tabs/windows using that address and retry; do not clear site data. Restarting the development server does not itself delete browser data.
 - Model replies support CommonMark and GitHub-flavored Markdown. Raw HTML is not executed and remote images are not loaded. User-selected image attachments are separate local previews, not remote Markdown images.
+- After the first reply, the composer's bottom bar shows the context used by the last request (provider-reported input + output, e.g. `13k / 131k tokens`). The limit comes from the provider's model list when it reports one (Anthropic, Groq, OpenRouter-style servers); OpenAI does not, so only the used part is shown.
 - Retry/restart/Clear actions appear at the bottom of chat history, including in short chats, and hide while scrolling up without covering messages.
 
 ### 6. Attach Text Files and Images
@@ -149,6 +152,17 @@ The accordion is fed from two sources:
 Reasoning content never bleeds into the main reply — the visible answer always
 stays clean.
 
+- **Reasoning is not sent back** with later turns: history carries only the
+  visible answers and tool calls/results. This keeps requests small and
+  provider-neutral; the trade-off is that a reasoning model rebuilds its chain
+  of thought each turn instead of continuing the previous one.
+- OpenAI requests use `store: false`, so responses are not retained by OpenAI
+  for later retrieval and nothing depends on server-side conversation state.
+- OpenAI shows reasoning summaries (and streams some reasoning models) only for
+  a **verified organization**. Without verification the app reports a clear
+  error; verify at platform.openai.com → Settings → Organization, or choose
+  another model.
+
 ---
 
 ## 🎯 Skills
@@ -178,11 +192,12 @@ For **local development**, all environment variables are optional — the app wo
 
 | Variable                     | Default   | Description                                                                                                                                                                                                                                                       |
 | ---------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLOW_PRIVATE_MCP`          | _(empty)_ | Set to `1` **only for local development** to allow `http://` URLs and private/localhost MCP servers through the SSRF-shielded proxy (and to allow a local Ollama URL on hosted deployments). **Never enable this on a publicly deployed instance** (e.g. Vercel). |
+| `ALLOW_PRIVATE_NETWORK`      | _(empty)_ | Private/LAN/localhost and `http://` targets (MCP servers, Ollama, custom provider URLs, model lists) are allowed automatically under `npm run dev` and **blocked in production builds** (Vercel, Docker, `next start`). Set to `1` only on a self-hosted instance that must reach your own LAN; **never on a public deployment**. `ALLOW_PRIVATE_MCP=1` is a deprecated alias. |
 | `UPSTASH_REDIS_REST_URL`     | _(empty)_ | Base HTTPS Upstash REST URL, without `/pipeline` or `/multi-exec`. With both credentials empty and `RATE_LIMIT_REQUIRED=0`, rate limiting is disabled for local use.                                                                                              |
 | `UPSTASH_REDIS_REST_TOKEN`   | _(empty)_ | Upstash Redis REST token (kept server-side only).                                                                                                                                                                                                                 |
 | `RATE_LIMIT_CHAT_PER_MINUTE` | `20`      | Chat requests per 60-second window, per trusted IP or shared bucket.                                                                                                                                                                                              |
 | `RATE_LIMIT_MCP_PER_MINUTE`  | `60`      | MCP proxy requests per 60-second window, per trusted IP or shared bucket.                                                                                                                                                                                         |
+| `RATE_LIMIT_MODELS_PER_MINUTE` | `30` | Model-list requests (Settings suggestions, context limit) per 60-second window, per trusted IP or shared bucket. |
 | `RATE_LIMIT_REQUIRED`        | `0`       | Set to `1` on public deployments: absent/incomplete Redis credentials then produce HTTP 503 instead of silently disabling protection.                                                                                                                             |
 | `RATE_LIMIT_FAIL_OPEN`       | `0`       | Configured Redis failures return 503 by default. `1` explicitly permits requests during Redis failures; not recommended for public use. Invalid configuration still fails closed.                                                                                 |
 | `RATE_LIMIT_IP_HEADER`       | _(empty)_ | Operator-selected header containing **one IP**, overwritten by a trusted edge. No header means one shared bucket per scope; visitor forwarding headers are ignored.                                                                                               |
@@ -190,9 +205,11 @@ For **local development**, all environment variables are optional — the app wo
 
 > **Rate limiting** uses one atomic Upstash REST transaction for the counter and TTL, with no extra npm dependencies or automatic retries. The 60-second window starts with the first request and is not extended by later requests. Quota exhaustion returns **429** with the remaining window in `Retry-After`; Redis failures return **503** by default. Invalid/incomplete configuration is never silently accepted. All attempts consume quota, including requests later rejected by the handler.
 
-> **Public deployment:** set `RATE_LIMIT_REQUIRED=1`, provide both Redis credentials and leave `RATE_LIMIT_FAIL_OPEN=0`. Without `RATE_LIMIT_IP_HEADER`, all users share the chat/MCP limits separately. For per-IP quotas, choose a header only after verifying that your proxy/hosting edge **overwrites** it with one actual client IP and the origin cannot be reached directly. Comma-separated forwarding chains and missing/invalid selected headers are rejected with 503. The application cannot verify that your reverse proxy is trustworthy; rate limiting does not replace access control or edge-level abuse protection.
+> **Public deployment:** set `RATE_LIMIT_REQUIRED=1`, provide both Redis credentials and leave `RATE_LIMIT_FAIL_OPEN=0`. Without `RATE_LIMIT_IP_HEADER`, all users share the chat, MCP and model-list limits separately. For per-IP quotas, choose a header only after verifying that your proxy/hosting edge **overwrites** it with one actual client IP and the origin cannot be reached directly. Comma-separated forwarding chains and missing/invalid selected headers are rejected with 503. The application cannot verify that your reverse proxy is trustworthy; rate limiting does not replace access control or edge-level abuse protection.
 
-> **Ollama URL protection:** on hosted deployments (detected via the `VERCEL` environment variable) a custom Ollama base URL must pass the same SSRF checks as MCP servers — it must be a public HTTPS endpoint. Locally this restriction does not apply, so `http://127.0.0.1:11434/api` keeps working out of the box. If you self-host on a VPS behind a reverse proxy and want the same protection there, restrict `/api/chat` bodies or set up equivalent network-level guards.
+> **Private-network protection (SSRF):** in production every server-side outbound request — MCP proxy, provider base URLs (Ollama, custom) and model lists — must target a public address; DNS answers are re-checked at connect time and redirects are not followed. A hosted app therefore cannot reach Ollama on your computer. For a self-hosted instance next to a local Ollama or LAN server, set `ALLOW_PRIVATE_NETWORK=1`.
+
+> **Function duration:** the chat route declares `maxDuration = 300` seconds and the MCP proxy `90` (a tool call waits up to 60 s). On Vercel Hobby this requires **Fluid compute** (enabled by default on new projects); without it Hobby caps functions at 60 s and long reasoning/tool turns are cut off.
 
 ---
 

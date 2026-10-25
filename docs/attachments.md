@@ -56,9 +56,9 @@ The inspector replaces attachment content with an explicit redaction marker whil
 
 Native OpenAI/Anthropic/Groq image hints use small exact verified model-ID lists. Unknown IDs remain unknown; names are not matched by broad heuristics. These lists are advisory, never a send gate. An advertised image modality does not guarantee account access, model availability or context capacity. Recognized provider refusals distinguish image incompatibility from unavailable models/endpoints without displaying private upstream responses.
 
-Custom endpoints continue using the application's existing OpenAI Responses adapter. They must support that API; an OpenAI-compatible chat-completions-only service is not automatically a compatible custom Responses endpoint. Custom and Ollama image support stays unknown, without requiring explicit compatibility opt-in.
+Custom endpoints use the OpenAI-compatible **/chat/completions** API (images as `image_url` data URLs), the API that vLLM, LM Studio, OpenRouter, llama.cpp and similar servers implement. Custom and Ollama image support stays unknown, without requiring explicit compatibility opt-in.
 
-Ollama uses the installed AI SDK 6-compatible OpenAI chat-completions adapter, replacing the incompatible SDK V1 adapter. Native **/api** and root URLs normalize to **/v1**; explicit **/v1** is retained. Hosted SSRF restrictions remain in force. Real Ollama inference still depends on the user's local installation; localhost on a hosted server is not the user's computer.
+Ollama uses the installed AI SDK 6-compatible OpenAI chat-completions adapter, replacing the incompatible SDK V1 adapter. Native **/api** and root URLs normalize to **/v1**; explicit **/v1** is retained. Production SSRF restrictions remain in force (`ALLOW_PRIVATE_NETWORK=1` lifts them for a self-hosted instance). Real Ollama inference still depends on the user's local installation; localhost on a hosted server is not the user's computer.
 
 ## Verification
 
