@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatExecution, recoverMessages, summarizeUsage, providerHistory } from './execution';
+import { ChatExecution, recoverMessages, summarizeUsage, providerHistory, toolErrorText, canContinueModel } from './execution';
 import { classifyError, retryDelay } from './errors';
 import { canRetryTool } from './toolSafety';
 import type { AttachmentRef, Message } from '../types';
@@ -74,6 +74,43 @@ test('parallel approvals and double clicks checkpoint results before exactly one
   assert.equal(calls, 2);
   assert.ok(checkpoints.some(ms => ms.at(-1)?.toolInvocations?.every(t => t.state === 'result')));
 });
+test('MCP isError reaches the model as { error: text } and the turn continues; transport failures still stop', async () => {
+  const { engine } = setup();
+  const seen: unknown[] = [];
+  let calls = 0;
+  const request = async (_signal: AbortSignal, history: Message[]) => {
+    if (++calls === 1) return stream({ type: 'tool-input-available', toolCallId: 'a', toolName: 'write', input: {} }, finish);
+    seen.push(history.at(-1)?.toolInvocations?.[0].result);
+    return stream({ type: 'tool-input-available', toolCallId: 'b', toolName: 'write', input: { fixed: true } }, finish);
+  };
+  await engine.start(request);
+  await engine.approve(engine.messages.at(-1)!.id, 'a', async () => ({ isError: true,
+    content: [{ type: 'text', text: 'missing field "title"' }, { type: 'image', data: 'x' }, { type: 'text', text: 'see docs' }] }), request);
+  assert.equal(calls, 2);
+  assert.deepEqual(seen, [{ error: 'missing field "title"\nsee docs' }]);
+  const first = engine.messages.find(m => m.toolInvocations?.[0].toolCallId === 'a')!;
+  assert.equal(first.toolInvocations![0].state, 'result');
+  assert.equal(first.execution?.status, 'complete');
+  assert.equal(canContinueModel({ ...first, execution: { ...first.execution!, status: 'interrupted', continuationPending: true } }), true);
+  // The next call still needs explicit approval.
+  assert.equal(engine.messages.at(-1)?.toolInvocations?.[0].state, 'needs-approval');
+  assert.equal(engine.messages.at(-1)?.execution?.status, 'approval');
+  await engine.approve(engine.messages.at(-1)!.id, 'b', async () => { throw new Error('socket closed'); }, request);
+  assert.equal(calls, 2);
+  assert.equal(engine.messages.at(-1)?.toolInvocations?.[0].outcome, 'unknown');
+  assert.equal(engine.messages.at(-1)?.execution?.status, 'error');
+});
+
+test('toolErrorText joins text parts, truncates and falls back when there is no text', () => {
+  assert.equal(toolErrorText({ isError: true, content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }), 'a\nb');
+  assert.equal(toolErrorText({ isError: true, content: [{ type: 'image' }] }), 'MCP reported a tool error without details.');
+  assert.equal(toolErrorText({ isError: true }), 'MCP reported a tool error without details.');
+  assert.equal(toolErrorText(null), 'MCP reported a tool error without details.');
+  const long = toolErrorText({ isError: true, content: [{ type: 'text', text: 'x'.repeat(10000) }] });
+  assert.ok(long.length < 4100 && long.startsWith('x'.repeat(4000)) && long.endsWith('[truncated]'));
+  assert.equal(toolErrorText({ isError: true, content: [{ type: 'text', text: 'x'.repeat(4000) }] }).length, 4000);
+});
+
 test('stream error preserves partial text, suppresses later finish and approvals; manual retry excludes failed output', async () => {
   const { engine } = setup();
   await engine.start(async () => stream({ type: 'text-delta', delta: 'partial' }, { type: 'error', errorText: 'secret upstream' }, { type: 'text-delta', delta: 'late overwrite' }, finish));

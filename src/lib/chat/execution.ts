@@ -14,6 +14,14 @@ type Hooks = {
 const terminal = new Set(['error', 'cancelled', 'interrupted']);
 const id = () => crypto.randomUUID();
 type Operation = { generation: number; kind: 'model' | 'approval' | 'tools'; messageId?: string };
+const TOOL_ERROR_LIMIT = 4000;
+export function toolErrorText(result: unknown): string {
+  const content = (result as { content?: unknown })?.content;
+  const text = (Array.isArray(content) ? content : [])
+    .map(part => part?.type === 'text' && typeof part.text === 'string' ? part.text : '').filter(Boolean).join('\n').trim();
+  if (!text) return 'MCP reported a tool error without details.';
+  return text.length > TOOL_ERROR_LIMIT ? `${text.slice(0, TOOL_ERROR_LIMIT)}… [truncated]` : text;
+}
 export function canContinueModel(message: Message | undefined) {
   if (!message?.execution || !terminal.has(message.execution.status)) return false;
   return !message.toolInvocations?.length || (message.execution.continuationPending === true &&
@@ -437,8 +445,10 @@ export class ChatExecution {
       sent = true;
       const result = await execute(call, controller.signal);
       if (!this.owns(owner)) return;
+      // A tool-reported error is a known outcome: the model gets the text and the turn continues
+      // (further calls still need approval). Only transport failures are 'unknown' (see catch).
       const failed = !!(result as { isError?: boolean })?.isError;
-      this.setTool(messageId, toolId, { state: 'result', result: failed ? { error: 'MCP reported a tool error. Verify the result before retrying.' } : result, outcome: failed ? 'error' : 'success' });
+      this.setTool(messageId, toolId, { state: 'result', result: failed ? { error: toolErrorText(result) } : result, outcome: 'success' });
     } catch {
       if (!this.owns(owner)) return;
       this.setTool(messageId, toolId, sent ? { state: 'result', outcome: 'unknown', result: { error: chatError('mcp').message } } : { state: 'needs-approval' });
